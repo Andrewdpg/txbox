@@ -8,8 +8,10 @@
 
 mod error;
 mod retention;
+mod store;
 mod types;
 
 pub use error::{HandlerError, InboxError};
 pub use retention::RetentionPolicy;
+pub use store::{BoxFuture, InboxExt, InboxStore};
 pub use types::{Claim, ConsumerId, MessageId, Outcome};
