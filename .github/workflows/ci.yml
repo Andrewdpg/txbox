@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the previous run's answer irrelevant.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Reads rust-toolchain.toml, so CI and a local checkout cannot drift onto
+      # different compilers.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - run: cargo fmt --check
+
+      # Neither backend feature is enabled by default, so this is the shape a
+      # dependent sees before choosing one. It has to stand on its own.
+      - run: cargo clippy --all-targets -- -D warnings
+
+      - run: cargo clippy --all-targets --features postgres,sqlite -- -D warnings
+
+      # The README is included as crate documentation, so a link that breaks in
+      # it fails here rather than silently on docs.rs.
+      - run: cargo doc --no-deps --features postgres,sqlite
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # One backend failing says nothing about the other; report both.
+      fail-fast: false
+      matrix:
+        # Each backend is exercised alone, not only in combination. Modules
+        # behind separate features can compile together and still fail
+        # individually, and a dependent enables exactly one.
+        features: [postgres, sqlite]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      # The PostgreSQL suites start their own database through testcontainers;
+      # ubuntu-latest already runs a Docker daemon, so nothing to set up here.
+      - run: cargo test --features ${{ matrix.features }}

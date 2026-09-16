@@ -1,5 +1,7 @@
 # txbox
 
+[![CI](https://github.com/Andrewdpg/txbox/actions/workflows/ci.yml/badge.svg)](https://github.com/Andrewdpg/txbox/actions/workflows/ci.yml)
+
 Transactional inbox pattern for reliable message processing in Rust.
 
 ## The problem
