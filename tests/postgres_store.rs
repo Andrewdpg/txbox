@@ -192,3 +192,59 @@ async fn postgres_refuses_an_identifier_too_large_to_index() {
     // And the guard means this can never be reached through the public API.
     assert!(MessageId::try_from(oversized).is_err());
 }
+
+/// One message per transaction means one fsync per message. `claim` is public
+/// and takes `&mut Conn`, so a caller can claim a whole batch inside a single
+/// transaction and amortise that cost. Nothing exercised that composition until
+/// now, which is why the README never offered it.
+///
+/// The property that makes it safe is subtle: a claim is visible to later
+/// statements in its own transaction before it is visible to anyone else. A
+/// message repeated inside one batch is therefore caught by the same mechanism
+/// that catches a redelivery, with no bookkeeping by the caller.
+#[tokio::test]
+async fn a_duplicate_inside_one_batch_is_caught_before_the_commit() {
+    let (_container, inbox) = inbox().await;
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let batch = ["a", "b", "a"].map(|id| MessageId::try_from(id).unwrap());
+
+    let mut tx = inbox.begin().await.unwrap();
+    let mut claims = Vec::new();
+    for id in &batch {
+        claims.push(inbox.claim(&mut tx, &consumer, id).await.unwrap());
+    }
+    inbox.commit(tx).await.unwrap();
+
+    assert_eq!(claims, [Claim::Fresh, Claim::Fresh, Claim::Duplicate]);
+}
+
+/// The other half of the bargain. A batch is one transaction, so it is also one
+/// unit of failure: if anything in it fails, every message it covered goes back
+/// to being unclaimed and the broker redelivers the whole batch. That is the
+/// cost of amortising the commit, and a caller choosing a batch size is
+/// choosing how much work a single failure repeats.
+#[tokio::test]
+async fn a_batch_that_rolls_back_leaves_every_message_unclaimed() {
+    let (_container, inbox) = inbox().await;
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let batch = ["a", "b"].map(|id| MessageId::try_from(id).unwrap());
+
+    let mut tx = inbox.begin().await.unwrap();
+    for id in &batch {
+        assert_eq!(
+            inbox.claim(&mut tx, &consumer, id).await.unwrap(),
+            Claim::Fresh
+        );
+    }
+    tx.rollback().await.unwrap();
+
+    for id in &batch {
+        let mut tx = inbox.begin().await.unwrap();
+        assert_eq!(
+            inbox.claim(&mut tx, &consumer, id).await.unwrap(),
+            Claim::Fresh,
+            "a rolled back batch must leave {id} redeliverable"
+        );
+        inbox.commit(tx).await.unwrap();
+    }
+}

@@ -196,6 +196,60 @@ CREATE INDEX IF NOT EXISTS idx_inbox_processed_at
     ON inbox_messages (processed_at);
 ```
 
+## Batching
+
+`process` opens a transaction per message, so a high-volume consumer pays
+one commit — and one fsync — per message. `claim` is public and takes the
+backend connection directly, so a caller can claim a whole batch inside a
+single transaction instead:
+
+```rust
+use txbox::postgres::PgInbox;
+use txbox::sqlx;
+use txbox::{Claim, ConsumerId, InboxStore, MessageId};
+
+async fn run(
+    inbox: &PgInbox,
+    consumer: &ConsumerId,
+    batch: &[MessageId],
+) -> Result<(), Box<dyn std::error::Error>> {
+let mut tx = inbox.begin().await?;
+
+for id in batch {
+    if inbox.claim(&mut tx, consumer, id).await? == Claim::Fresh {
+        sqlx::query("INSERT INTO orders (message_id) VALUES ($1)")
+            .bind(id.as_str())
+            .execute(&mut *tx)
+            .await?;
+    }
+}
+
+inbox.commit(tx).await?;
+Ok(()) }
+```
+
+Two things make this work, and one of them is not obvious:
+
+- **A repeated message inside one batch is caught for free.** A claim is
+  visible to later statements in its own transaction before it is visible
+  to anyone else, so the second occurrence of an id sees the first and
+  reports `Duplicate`. The caller needs no bookkeeping of its own.
+- **A batch is one unit of failure.** If anything in it fails, the
+  transaction rolls back and *every* message it covered becomes unclaimed
+  again — the broker redelivers the whole batch and the handlers that had
+  already succeeded run a second time. Choosing a batch size is choosing
+  how much work one failure repeats.
+
+Two costs come with it. The transaction is held open for the whole
+batch's work, so a concurrent consumer racing for any id in that batch
+blocks for that entire span rather than for one message. And commit the
+broker's offsets only after `commit` returns, for the batch as a whole.
+
+To abandon a batch, drop the transaction: that rolls it back. `InboxStore`
+has no explicit rollback, so generic code relies on the drop; code written
+against a concrete backend can call `rollback()` on the transaction
+itself.
+
 ## Retention
 
 ```rust
