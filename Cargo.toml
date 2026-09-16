@@ -19,16 +19,22 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"]
 thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rdkafka = { version = "0.39", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 testcontainers-modules = { version = "0.13", features = ["postgres"] }
+tracing-subscriber = "0.3"
 
 [features]
 default = []
 postgres = ["sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
 sqlite = ["sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+example-kafka = ["dep:rdkafka", "postgres"]
 
+[[example]]
+name = "kafka_consumer"
+required-features = ["example-kafka"]
 
 [package.metadata.docs.rs]
 features = ["postgres", "sqlite"]
