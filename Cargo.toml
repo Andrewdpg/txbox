@@ -1,0 +1,35 @@
+[package]
+name = "txbox"
+version = "0.1.0"
+edition = "2024"
+# Inherited from sqlx 0.9, whose MSRV policy sets 1.94.0 for this release
+# cycle. This is not a preference: it is the floor the dependency imposes.
+rust-version = "1.94.0"
+license = "MIT OR Apache-2.0"
+description = "Transactional inbox pattern for idempotent message processing"
+repository = "https://github.com/Andrewdpg/txbox"
+# "outbox" is deliberately absent: 0.1.0 ships the inbox only, and a keyword
+# is a promise to everyone searching for it.
+keywords = ["inbox", "idempotency", "deduplication", "messaging", "kafka"]
+categories = ["database", "asynchronous"]
+exclude = ["docs/"]
+
+[dependencies]
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+testcontainers-modules = { version = "0.13", features = ["postgres"] }
+
+[features]
+default = []
+postgres = ["sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+sqlite = ["sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+
+
+[package.metadata.docs.rs]
+features = ["postgres", "sqlite"]
+rustdoc-args = ["--cfg", "docsrs"]
