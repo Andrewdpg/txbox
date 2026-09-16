@@ -35,8 +35,8 @@ async fn inbox() -> (ContainerAsync<PostgresImage>, PgInbox) {
 #[tokio::test]
 async fn claim_is_fresh_once_then_duplicate() {
     let (_container, inbox) = inbox().await;
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
@@ -56,11 +56,11 @@ async fn claim_is_fresh_once_then_duplicate() {
 #[tokio::test]
 async fn distinct_consumers_both_process_the_same_message() {
     let (_container, inbox) = inbox().await;
-    let id = MessageId::from("shared-1");
+    let id = MessageId::try_from("shared-1").unwrap();
 
     for consumer in ["billing", "notifications"] {
         let outcome = inbox
-            .process(&ConsumerId::from(consumer), &id, |_c| {
+            .process(&ConsumerId::try_from(consumer).unwrap(), &id, |_c| {
                 Box::pin(async { Ok(()) })
             })
             .await
@@ -72,10 +72,10 @@ async fn distinct_consumers_both_process_the_same_message() {
 #[tokio::test]
 async fn purge_deletes_only_entries_outside_the_window() {
     let (_container, inbox) = inbox().await;
-    let consumer = ConsumerId::from("billing");
+    let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
-        .process(&consumer, &MessageId::from("old"), |_c| {
+        .process(&consumer, &MessageId::try_from("old").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -88,7 +88,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .unwrap();
 
     inbox
-        .process(&consumer, &MessageId::from("new"), |_c| {
+        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -98,7 +98,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
     assert_eq!(inbox.purge(&policy).await.unwrap(), 1);
 
     let outcome = inbox
-        .process(&consumer, &MessageId::from("new"), |_c| {
+        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await

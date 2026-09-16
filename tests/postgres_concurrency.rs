@@ -42,8 +42,8 @@ async fn concurrent_delivery_applies_the_effect_exactly_once() {
     let inbox = Arc::new(PgInbox::new(pool.clone()));
     inbox.migrate().await.expect("run migrations");
 
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("contended-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("contended-1").unwrap();
 
     let mut handles = Vec::new();
     for _ in 0..2 {

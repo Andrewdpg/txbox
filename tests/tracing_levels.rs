@@ -45,8 +45,8 @@ async fn duplicates_are_logged_at_debug_never_warn() {
     inbox.migrate().await.unwrap();
 
     let spy = LevelSpy::default();
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     inbox
         .process(&consumer, &id, |_c| Box::pin(async { Ok(()) }))

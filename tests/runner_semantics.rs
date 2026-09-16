@@ -91,8 +91,8 @@ impl InboxStore for FakeStore {
 #[tokio::test]
 async fn first_delivery_runs_the_handler() {
     let store = FakeStore::default();
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     let outcome = store
         .process(&consumer, &id, |conn| {
@@ -111,8 +111,8 @@ async fn first_delivery_runs_the_handler() {
 #[tokio::test]
 async fn second_delivery_is_skipped_and_the_handler_never_runs() {
     let store = FakeStore::default();
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     store
         .process(&consumer, &id, |conn| {
@@ -138,11 +138,11 @@ async fn second_delivery_is_skipped_and_the_handler_never_runs() {
 #[tokio::test]
 async fn distinct_consumers_both_process_the_same_message() {
     let store = FakeStore::default();
-    let id = MessageId::from("m-1");
+    let id = MessageId::try_from("m-1").unwrap();
 
     for consumer in ["billing", "notifications"] {
         let outcome = store
-            .process(&ConsumerId::from(consumer), &id, |conn| {
+            .process(&ConsumerId::try_from(consumer).unwrap(), &id, |conn| {
                 Box::pin(async move {
                     conn.effects.push("handled".to_owned());
                     Ok(())
@@ -162,8 +162,8 @@ async fn a_failing_handler_discards_the_effect() {
 
     let result = store
         .process(
-            &ConsumerId::from("billing"),
-            &MessageId::from("m-1"),
+            &ConsumerId::try_from("billing").unwrap(),
+            &MessageId::try_from("m-1").unwrap(),
             |conn| {
                 Box::pin(async move {
                     conn.effects.push("charged".to_owned());

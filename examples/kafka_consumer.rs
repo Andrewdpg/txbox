@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The consumer id namespaces the inbox. Two services consuming the same
     // topic MUST use different values, or the second will skip every message
     // the first has already handled.
-    let consumer_id = ConsumerId::from("orders-billing");
+    let consumer_id = ConsumerId::try_from("orders-billing")?;
 
     let consumer: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
@@ -68,12 +68,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The only broker-specific line in the whole program: pick a stable
         // identifier. A producer-supplied key is better than the offset,
         // which changes if the message is republished.
-        let id = MessageId::from(
-            message
-                .key_view::<str>()
-                .transpose()?
-                .ok_or("message has no key")?,
-        );
+        let key = message.key_view::<str>().transpose()?;
+
+        // A missing or malformed key is a poison message: it fails the same way
+        // on every redelivery, so retrying it would stall the partition
+        // forever. Commit past it instead. A real consumer dead-letters it
+        // first, rather than dropping it as this example does.
+        let id = match key.map(MessageId::try_from) {
+            Some(Ok(id)) => id,
+            rejected => {
+                tracing::error!(?rejected, "unprocessable message id, skipping");
+                consumer.commit_message(&message, CommitMode::Async)?;
+                continue;
+            }
+        };
 
         let payload = message.payload().unwrap_or_default().to_vec();
 

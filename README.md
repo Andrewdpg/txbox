@@ -54,7 +54,7 @@ The same consumer with `txbox`:
 ```rust,ignore
 loop {
     let message = consumer.recv().await?;
-    let id = MessageId::from(message.key_view::<str>().transpose()?.ok_or("no key")?);
+    let id = MessageId::try_from(message.key_view::<str>().transpose()?.ok_or("no key")?)?;
     let payload = message.payload().unwrap_or_default().to_vec();
 
     let outcome = inbox
@@ -128,8 +128,8 @@ let pool = PgPoolOptions::new()
 let inbox = PgInbox::new(pool);
 inbox.migrate().await?; // explicit — see "Migrations" below
 
-let consumer = ConsumerId::from("orders-billing");
-let id = MessageId::from("msg-123");
+let consumer = ConsumerId::try_from("orders-billing")?;
+let id = MessageId::try_from("msg-123")?;
 
 let outcome = inbox
     .process(&consumer, &id, |conn| {
@@ -292,6 +292,36 @@ production use. Specifically:
   replace them with your own.
 - The purge loop in the example runs in-process for readability. As
   described above, run it as a scheduled job instead.
+
+## Identifiers
+
+`ConsumerId` and `MessageId` are validated when they are built, not when
+the database is touched. Both reject an empty value and anything longer
+than their byte limit — 255 for `ConsumerId`, 512 for `MessageId` —
+returning [`InvalidId`].
+
+Both rules guard a real failure, and both failures are silent or
+permanent rather than merely inconvenient:
+
+- **Empty.** Every empty identifier equals every other one. A producer
+  emitting keyless messages would have all of them collapse onto a
+  single inbox row, and every message after the first would be skipped
+  as a duplicate of a message it has nothing to do with. Nothing logs an
+  error; the data is simply missing.
+- **Too long.** PostgreSQL rejects a btree index entry larger than about
+  2704 bytes, and the inbox's primary key spans both identifiers. Past
+  that, the `INSERT` in `claim` fails permanently. A caller following
+  this crate's own advice — treat `InboxError::Backend` as transient and
+  retry it — would retry forever and stall the partition on one
+  malformed message. SQLite has no such limit, so the failure would not
+  reproduce in local development.
+
+Validating at construction makes the distinction impossible to get
+wrong: `InvalidId` is a separate type from `InboxError`, so an
+unprocessable identifier cannot be mistaken for a retryable backend
+blip. A message whose id fails to build is a poison message — dead-letter
+it and commit past it, as `examples/kafka_consumer.rs` shows. Retrying it
+cannot help, because it will fail identically every time.
 
 ## Consumer ids
 

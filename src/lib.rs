@@ -18,7 +18,7 @@ pub mod sqlite;
 mod store;
 mod types;
 
-pub use error::{HandlerError, InboxError};
+pub use error::{HandlerError, InboxError, InvalidId};
 pub use retention::RetentionPolicy;
 pub use store::{BoxFuture, InboxExt, InboxStore};
 pub use types::{Claim, ConsumerId, MessageId, Outcome};

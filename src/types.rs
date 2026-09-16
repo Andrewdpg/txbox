@@ -1,3 +1,5 @@
+use crate::error::InvalidId;
+
 /// Identifies the logical consumer that processed a message.
 ///
 /// Two independent consumers of the same topic must use different values,
@@ -11,23 +13,39 @@ pub struct ConsumerId(String);
 pub struct MessageId(String);
 
 macro_rules! string_newtype {
-    ($name:ident) => {
+    ($name:ident, $max_len:expr) => {
         impl $name {
+            /// The longest value this identifier accepts, in bytes.
+            pub const MAX_LEN: usize = $max_len;
+
             /// Borrows the underlying string.
             pub fn as_str(&self) -> &str {
                 &self.0
             }
         }
 
-        impl From<String> for $name {
-            fn from(value: String) -> Self {
-                Self(value)
+        impl TryFrom<String> for $name {
+            type Error = InvalidId;
+
+            fn try_from(value: String) -> Result<Self, InvalidId> {
+                if value.is_empty() {
+                    return Err(InvalidId::Empty);
+                }
+                if value.len() > Self::MAX_LEN {
+                    return Err(InvalidId::TooLong {
+                        len: value.len(),
+                        max: Self::MAX_LEN,
+                    });
+                }
+                Ok(Self(value))
             }
         }
 
-        impl From<&str> for $name {
-            fn from(value: &str) -> Self {
-                Self(value.to_owned())
+        impl TryFrom<&str> for $name {
+            type Error = InvalidId;
+
+            fn try_from(value: &str) -> Result<Self, InvalidId> {
+                Self::try_from(value.to_owned())
             }
         }
 
@@ -39,8 +57,8 @@ macro_rules! string_newtype {
     };
 }
 
-string_newtype!(ConsumerId);
-string_newtype!(MessageId);
+string_newtype!(ConsumerId, 255);
+string_newtype!(MessageId, 512);
 
 /// The result of attempting to record a message in the inbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,10 +92,41 @@ impl<T> Outcome<T> {
 mod tests {
     use super::*;
 
+    /// The limit is a byte budget, because that is what the index measures.
+    /// Counting characters instead would let a multi-byte identifier through
+    /// and move the failure back into the database.
+    #[test]
+    fn the_length_limit_counts_bytes_not_characters() {
+        let multibyte = "\u{00e9}".repeat(MessageId::MAX_LEN);
+        assert_eq!(multibyte.chars().count(), MessageId::MAX_LEN);
+        assert!(MessageId::try_from(multibyte).is_err());
+    }
+
+    #[test]
+    fn a_message_id_beyond_the_length_limit_is_rejected() {
+        // PostgreSQL refuses a btree entry larger than ~2704 bytes. Without
+        // this check the INSERT in `claim` fails permanently, is reported as a
+        // backend error (which callers are told to retry), and stalls the
+        // partition forever on one malformed message.
+        let too_long = "x".repeat(MessageId::MAX_LEN + 1);
+        assert!(MessageId::try_from(too_long).is_err());
+    }
+
+    #[test]
+    fn an_empty_message_id_is_rejected() {
+        // A producer that sends messages without a key would otherwise collapse
+        // every one of them onto the same id, and all but the first would be
+        // silently skipped as duplicates.
+        assert!(MessageId::try_from("").is_err());
+    }
+
     #[test]
     fn ids_are_constructible_from_str_and_string() {
-        assert_eq!(ConsumerId::from("billing").as_str(), "billing");
-        assert_eq!(MessageId::from(String::from("m-1")).as_str(), "m-1");
+        assert_eq!(ConsumerId::try_from("billing").unwrap().as_str(), "billing");
+        assert_eq!(
+            MessageId::try_from(String::from("m-1")).unwrap().as_str(),
+            "m-1"
+        );
     }
 
     #[test]

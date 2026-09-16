@@ -23,8 +23,8 @@ async fn inbox() -> SqliteInbox {
 #[tokio::test]
 async fn claim_is_fresh_once_then_duplicate() {
     let inbox = inbox().await;
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
@@ -44,8 +44,8 @@ async fn claim_is_fresh_once_then_duplicate() {
 #[tokio::test]
 async fn a_rolled_back_claim_leaves_no_trace() {
     let inbox = inbox().await;
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
@@ -65,8 +65,8 @@ async fn a_rolled_back_claim_leaves_no_trace() {
 #[tokio::test]
 async fn a_failing_handler_lets_the_retry_succeed() {
     let inbox = inbox().await;
-    let consumer = ConsumerId::from("billing");
-    let id = MessageId::from("m-1");
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
 
     let failed = inbox
         .process(&consumer, &id, |_conn| {
@@ -85,10 +85,10 @@ async fn a_failing_handler_lets_the_retry_succeed() {
 #[tokio::test]
 async fn purge_deletes_only_entries_outside_the_window() {
     let inbox = inbox().await;
-    let consumer = ConsumerId::from("billing");
+    let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
-        .process(&consumer, &MessageId::from("old"), |_c| {
+        .process(&consumer, &MessageId::try_from("old").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -102,7 +102,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .unwrap();
 
     inbox
-        .process(&consumer, &MessageId::from("new"), |_c| {
+        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -113,7 +113,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
 
     // The recent entry survived, so it is still seen as a duplicate.
     let outcome = inbox
-        .process(&consumer, &MessageId::from("new"), |_c| {
+        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -124,11 +124,11 @@ async fn purge_deletes_only_entries_outside_the_window() {
 #[tokio::test]
 async fn purge_batches_across_multiple_passes() {
     let inbox = inbox().await;
-    let consumer = ConsumerId::from("billing");
+    let consumer = ConsumerId::try_from("billing").unwrap();
 
     for message in ["m-1", "m-2", "m-3"] {
         inbox
-            .process(&consumer, &MessageId::from(message), |_c| {
+            .process(&consumer, &MessageId::try_from(message).unwrap(), |_c| {
                 Box::pin(async { Ok(()) })
             })
             .await

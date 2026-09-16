@@ -1,6 +1,39 @@
 /// An error returned by a user-supplied message handler.
 pub type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
+/// An identifier rejected at construction.
+///
+/// Validation happens when the newtype is built, not when the database is
+/// touched, so a bad identifier can never reach `claim`. That matters for
+/// classification: a backend failure is usually transient and worth retrying,
+/// whereas this is permanent. A caller that could not tell them apart would
+/// retry an unprocessable message forever and stall its partition.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum InvalidId {
+    /// The identifier was empty.
+    ///
+    /// Every empty identifier is equal to every other, so a producer emitting
+    /// keyless messages would see all but the first silently skipped as
+    /// duplicates of one another.
+    #[error("identifier is empty")]
+    Empty,
+
+    /// The identifier was longer than the backend can index.
+    ///
+    /// PostgreSQL rejects a btree entry larger than roughly 2704 bytes, and
+    /// the inbox's primary key covers both identifiers. The limits here are
+    /// well inside that budget and generous next to any real broker key: a
+    /// UUID is 36 bytes.
+    #[error("identifier is {len} bytes, exceeding the {max}-byte limit")]
+    TooLong {
+        /// The length of the rejected identifier, in bytes.
+        len: usize,
+        /// The maximum length for this identifier, in bytes.
+        max: usize,
+    },
+}
+
 /// Errors produced by the inbox.
 ///
 /// The two variants are deliberately distinct because they demand different
