@@ -1,0 +1,107 @@
+#![cfg(feature = "postgres")]
+
+use std::time::Duration;
+
+use sqlx::postgres::PgPoolOptions;
+use testcontainers_modules::postgres::Postgres as PostgresImage;
+use testcontainers_modules::testcontainers::ContainerAsync;
+use testcontainers_modules::testcontainers::ImageExt;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use txbox::postgres::PgInbox;
+use txbox::{Claim, ConsumerId, InboxExt, InboxStore, MessageId, Outcome, RetentionPolicy};
+
+/// The container handle must stay alive for as long as the pool is used;
+/// dropping it stops the database.
+async fn inbox() -> (ContainerAsync<PostgresImage>, PgInbox) {
+    let container = PostgresImage::default()
+        .with_tag("15-alpine")
+        .start()
+        .await
+        .expect("start postgres");
+    let port = container.get_host_port_ipv4(5432).await.expect("map port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let pool = PgPoolOptions::new()
+        .max_connections(8)
+        .connect(&url)
+        .await
+        .expect("connect to postgres");
+
+    let inbox = PgInbox::new(pool);
+    inbox.migrate().await.expect("run migrations");
+    (container, inbox)
+}
+
+#[tokio::test]
+async fn claim_is_fresh_once_then_duplicate() {
+    let (_container, inbox) = inbox().await;
+    let consumer = ConsumerId::from("billing");
+    let id = MessageId::from("m-1");
+
+    let mut tx = inbox.begin().await.unwrap();
+    assert_eq!(
+        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        Claim::Fresh
+    );
+    inbox.commit(tx).await.unwrap();
+
+    let mut tx = inbox.begin().await.unwrap();
+    assert_eq!(
+        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        Claim::Duplicate
+    );
+    inbox.commit(tx).await.unwrap();
+}
+
+#[tokio::test]
+async fn distinct_consumers_both_process_the_same_message() {
+    let (_container, inbox) = inbox().await;
+    let id = MessageId::from("shared-1");
+
+    for consumer in ["billing", "notifications"] {
+        let outcome = inbox
+            .process(&ConsumerId::from(consumer), &id, |_c| {
+                Box::pin(async { Ok(()) })
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Outcome::Processed(()));
+    }
+}
+
+#[tokio::test]
+async fn purge_deletes_only_entries_outside_the_window() {
+    let (_container, inbox) = inbox().await;
+    let consumer = ConsumerId::from("billing");
+
+    inbox
+        .process(&consumer, &MessageId::from("old"), |_c| {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE inbox_messages SET processed_at = $1 WHERE message_id = 'old'")
+        .bind(chrono::Utc::now() - chrono::Duration::hours(1))
+        .execute(inbox.pool())
+        .await
+        .unwrap();
+
+    inbox
+        .process(&consumer, &MessageId::from("new"), |_c| {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
+
+    let policy = RetentionPolicy::new(Duration::from_secs(600));
+    assert_eq!(inbox.purge(&policy).await.unwrap(), 1);
+
+    let outcome = inbox
+        .process(&consumer, &MessageId::from("new"), |_c| {
+            Box::pin(async { Ok(()) })
+        })
+        .await
+        .unwrap();
+    assert_eq!(outcome, Outcome::Skipped);
+}
