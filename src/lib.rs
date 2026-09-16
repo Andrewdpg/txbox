@@ -8,6 +8,9 @@
 
 mod error;
 mod retention;
+#[cfg(feature = "sqlite")]
+#[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
+pub mod sqlite;
 mod store;
 mod types;
 
