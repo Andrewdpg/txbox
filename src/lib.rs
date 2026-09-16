@@ -12,6 +12,14 @@
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+/// The `sqlx` version this crate was built against.
+///
+/// Handlers write their own SQL and backends are constructed from an `sqlx`
+/// pool, so callers need the same `sqlx` this crate uses. Re-exporting it means
+/// they cannot end up on a different version by accident, and can reach it as
+/// `txbox::sqlx` without declaring the dependency twice.
+pub use sqlx;
+
 mod error;
 #[cfg(feature = "postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]

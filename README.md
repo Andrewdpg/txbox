@@ -100,6 +100,11 @@ exactly-once.
 
 Neither feature is enabled by default; enable the one you need.
 
+Handlers write their own SQL and backends are built from an `sqlx` pool,
+so `sqlx` is re-exported as `txbox::sqlx`. Reach it there rather than
+declaring the dependency separately, and the two cannot drift onto
+different versions.
+
 Two backend behaviors differ and are worth knowing:
 
 - On PostgreSQL, a consumer that loses the claim race **blocks** until
@@ -214,11 +219,19 @@ spike, delete entries that are still inside the redelivery window just
 because enough newer rows pushed them out — letting duplicates through
 at exactly the moment of peak load, which is the worst possible time.
 
-`processed_at` and the purge cutoff both come from the clock of
-whichever process runs them, not from the database. Keep hosts
-NTP-synced and leave margin on `max_age`: a purge host running fast
-will delete rows still inside the retention window of a slow consumer
-host.
+On PostgreSQL, `processed_at` and the purge cutoff both come from the
+database's own clock (`now()`), not from the process that happens to be
+running. That matters because the rule above is temporal: a replica with
+a lagging clock would write rows that look older than they are, and a
+purge host running fast would delete rows still inside the window — both
+at the worst possible moment, under the load that put the extra replicas
+there. The database is the one clock every replica already shares, so
+there is nothing to keep in sync.
+
+On SQLite the timestamp still comes from the calling process, because
+there is nowhere else for it to come from: SQLite runs inside that
+process, so its clock *is* the caller's clock and the skew described
+above cannot arise.
 
 ## Purge scheduling
 

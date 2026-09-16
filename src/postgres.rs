@@ -1,6 +1,5 @@
 //! PostgreSQL implementation of [`InboxStore`].
 
-use chrono::Utc;
 use sqlx::migrate::Migrator;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tracing::Instrument;
@@ -12,14 +11,27 @@ use crate::types::{Claim, ConsumerId, MessageId};
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
+// `now()` is the database's clock, and the database is the one clock every
+// replica already shares. Retention is a temporal invariant — `max_age` must
+// exceed the broker's redelivery window — so a timestamp taken from whichever
+// replica happened to write the row is only as trustworthy as that replica's
+// clock. A slow one writes rows that look older than they are, and the purge
+// deletes them while the broker can still redeliver. Reading the clock here
+// removes the failure rather than asking operators to keep NTP healthy.
 const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
-                         VALUES ($1, $2, $3) \
+                         VALUES ($1, $2, now()) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
 
+// `ctid` addresses the row directly, so the delete is a fetch by physical
+// location rather than a second lookup through the primary key. `ORDER BY
+// processed_at` costs nothing — the index on that column already supplies the
+// order — and makes each batch take the oldest rows, so repeated passes move
+// forward predictably instead of deleting an arbitrary subset each time.
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
-                         WHERE (consumer_id, message_id) IN ( \
-                             SELECT consumer_id, message_id FROM inbox_messages \
-                             WHERE processed_at < $1 LIMIT $2 \
+                         WHERE ctid IN ( \
+                             SELECT ctid FROM inbox_messages \
+                             WHERE processed_at < now() - make_interval(secs => $1) \
+                             ORDER BY processed_at LIMIT $2 \
                          )";
 
 /// An inbox backed by PostgreSQL.
@@ -80,7 +92,6 @@ impl InboxStore for PgInbox {
                 let affected = sqlx::query(CLAIM_SQL)
                     .bind(consumer.as_str())
                     .bind(id.as_str())
-                    .bind(Utc::now())
                     .execute(&mut *conn)
                     .await?
                     .rows_affected();
@@ -97,15 +108,13 @@ impl InboxStore for PgInbox {
 
     fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>> {
         Box::pin(async move {
-            let cutoff = Utc::now()
-                - chrono::Duration::from_std(policy.max_age())
-                    .map_err(|e| InboxError::Backend(Box::new(e)))?;
+            let max_age = policy.max_age().as_secs_f64();
             let batch = i64::from(policy.batch_size());
 
             let mut total = 0u64;
             loop {
                 let affected = sqlx::query(PURGE_SQL)
-                    .bind(cutoff)
+                    .bind(max_age)
                     .bind(batch)
                     .execute(&self.pool)
                     .await?

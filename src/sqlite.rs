@@ -16,10 +16,18 @@ const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, pr
                          VALUES (?, ?, ?) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
 
+// Unlike the PostgreSQL backend, this one keeps taking the timestamp in the
+// caller's process. There is nowhere else to take it from: SQLite runs inside
+// that process, so its clock *is* the caller's clock and the skew between
+// replicas that motivates `now()` on PostgreSQL cannot arise here.
+//
+// `rowid` addresses the row directly, and `ORDER BY processed_at` takes the
+// oldest rows first so repeated batches move forward predictably.
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
-                         WHERE (consumer_id, message_id) IN ( \
-                             SELECT consumer_id, message_id FROM inbox_messages \
-                             WHERE processed_at < ? LIMIT ? \
+                         WHERE rowid IN ( \
+                             SELECT rowid FROM inbox_messages \
+                             WHERE processed_at < ? \
+                             ORDER BY processed_at LIMIT ? \
                          )";
 
 /// An inbox backed by SQLite.

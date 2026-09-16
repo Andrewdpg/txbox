@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use testcontainers_modules::testcontainers::ContainerAsync;
@@ -104,6 +105,44 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .await
         .unwrap();
     assert_eq!(outcome, Outcome::Skipped);
+}
+
+/// Retention is a temporal invariant: `max_age` must exceed the broker's
+/// redelivery window, or a purged row lets a redelivery through as fresh. An
+/// invariant measured against the clock of whichever replica happened to write
+/// the row is only as good as that replica's clock, and a slow one writes rows
+/// that look older than they are — purged early, inside the window, at exactly
+/// the load where extra replicas are running.
+///
+/// The database is already the one clock every replica shares, so the timestamp
+/// belongs to it. `now()` in PostgreSQL is the transaction's start time, so a
+/// row written by `claim` must equal it exactly. A timestamp taken in the
+/// application would land microseconds later.
+#[tokio::test]
+async fn processed_at_comes_from_the_database_clock() {
+    let (_container, inbox) = inbox().await;
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
+
+    let mut tx = inbox.begin().await.unwrap();
+    assert_eq!(
+        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        Claim::Fresh
+    );
+
+    let (stored, transaction_start): (DateTime<Utc>, DateTime<Utc>) =
+        sqlx::query_as("SELECT processed_at, now() FROM inbox_messages WHERE message_id = $1")
+            .bind(id.as_str())
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+
+    assert_eq!(
+        stored, transaction_start,
+        "processed_at must be the database's clock, not the caller's"
+    );
+
+    inbox.commit(tx).await.unwrap();
 }
 
 /// A deterministic, effectively incompressible string.
