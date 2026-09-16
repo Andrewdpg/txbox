@@ -105,3 +105,51 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .unwrap();
     assert_eq!(outcome, Outcome::Skipped);
 }
+
+/// A deterministic, effectively incompressible string.
+///
+/// PostgreSQL compresses index entries, so a repeated character fits in the
+/// index no matter how long it is — the size limit applies after compression.
+/// Real broker keys that get anywhere near the limit are base64 tokens, hashes
+/// or concatenated fields, none of which compress. This models those.
+fn incompressible(len: usize) -> String {
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            char::from(33 + (state % 94) as u8)
+        })
+        .collect()
+}
+
+/// `MessageId::MAX_LEN` is not an arbitrary number: PostgreSQL refuses to index
+/// a btree entry whose compressed size exceeds roughly 2704 bytes, and the
+/// inbox's primary key spans both identifiers. This pins that premise. If it
+/// ever stops holding — a new PostgreSQL release, a different index type — the
+/// limit should be revisited rather than quietly kept.
+#[tokio::test]
+async fn postgres_refuses_an_identifier_too_large_to_index() {
+    let (_container, inbox) = inbox().await;
+
+    let oversized = incompressible(4096);
+    let result = sqlx::query(
+        "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
+         VALUES ($1, $2, $3)",
+    )
+    .bind("billing")
+    .bind(&oversized)
+    .bind(chrono::Utc::now())
+    .execute(inbox.pool())
+    .await;
+
+    let error = result.expect_err("postgres must refuse to index this");
+    assert!(
+        error.to_string().contains("exceeds btree"),
+        "expected a btree size rejection, got: {error}"
+    );
+
+    // And the guard means this can never be reached through the public API.
+    assert!(MessageId::try_from(oversized).is_err());
+}

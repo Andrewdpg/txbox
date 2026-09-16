@@ -1,8 +1,13 @@
 //! Transactional inbox pattern for reliable message processing.
 //!
-//! See the crate README for usage. Backends are selected with the
-//! `postgres` and `sqlite` Cargo features; neither is enabled by default.
-
+//! Backends are selected with the `postgres` and `sqlite` Cargo features;
+//! neither is enabled by default.
+//!
+//! The README follows. It is included rather than summarised so that its
+//! examples compile as doctests: documentation that is never built is
+//! documentation that silently rots. The include is gated on `postgres`
+//! because the examples use that backend; `docs.rs` builds with it enabled.
+#![cfg_attr(feature = "postgres", doc = include_str!("../README.md"))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]

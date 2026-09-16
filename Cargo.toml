@@ -22,7 +22,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rdkafka = { version = "0.39", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 testcontainers-modules = { version = "0.13", features = ["postgres"] }
 tracing-subscriber = "0.3"
 
