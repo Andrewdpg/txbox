@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::error::InvalidId;
 
 /// Identifies the logical consumer that processed a message.
@@ -67,6 +69,55 @@ pub enum Claim {
     Fresh,
     /// The message was already recorded by this consumer.
     Duplicate,
+}
+
+/// A request to record a message in the inbox, submitted to
+/// [`InboxStore::claim`](crate::store::InboxStore::claim) and answered with a
+/// [`Claim`].
+///
+/// [`Consumer`](crate::consumer::Consumer) builds one internally on every call
+/// to `claim` or `process`; ordinary users of this crate never construct one.
+/// This type exists for third-party backend implementors, who read its fields
+/// to perform the claim.
+///
+/// It bundles the claim's identity — `consumer` and `id`, both required — with
+/// its policy — currently just `lock_timeout`, optional — behind one
+/// parameter instead of a growing list of positional arguments. `#[non_exhaustive]`
+/// so a future policy field (a new backend hint, say) can be added without
+/// breaking every implementor's call site.
+///
+/// Fields are public rather than hidden behind accessors: `#[non_exhaustive]`
+/// blocks external struct-literal construction and exhaustive destructuring,
+/// but field reads are unaffected, so a plain struct is simplest for
+/// implementors who only ever read it.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimRequest<'a> {
+    /// The consumer performing the claim.
+    pub consumer: &'a ConsumerId,
+    /// The message being claimed.
+    pub id: &'a MessageId,
+    /// Bounds how long the backend will wait for a contended row. See
+    /// [`InboxStore::claim`](crate::store::InboxStore::claim) for the
+    /// per-backend contract.
+    pub lock_timeout: Option<Duration>,
+}
+
+impl<'a> ClaimRequest<'a> {
+    /// Builds a request for `consumer` claiming `id`, with no lock timeout.
+    pub fn new(consumer: &'a ConsumerId, id: &'a MessageId) -> Self {
+        Self {
+            consumer,
+            id,
+            lock_timeout: None,
+        }
+    }
+
+    /// Sets the lock timeout.
+    pub fn with_lock_timeout(mut self, lock_timeout: Duration) -> Self {
+        self.lock_timeout = Some(lock_timeout);
+        self
+    }
 }
 
 /// The result of running a handler through the inbox.

@@ -6,7 +6,8 @@ use std::time::Duration;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use txbox::sqlite::SqliteInbox;
 use txbox::{
-    Claim, ConsumerId, InboxError, InboxExt, InboxStore, MessageId, Outcome, RetentionPolicy,
+    Claim, ClaimRequest, ConsumerId, InboxError, InboxExt, InboxStore, MessageId, Outcome,
+    RetentionPolicy,
 };
 
 async fn inbox() -> SqliteInbox {
@@ -31,14 +32,20 @@ async fn claim_is_fresh_once_then_duplicate() {
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Fresh
     );
     inbox.commit(tx).await.unwrap();
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Duplicate
     );
     inbox.commit(tx).await.unwrap();
@@ -52,14 +59,20 @@ async fn a_rolled_back_claim_leaves_no_trace() {
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Fresh
     );
     drop(tx); // rollback
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Fresh
     );
     inbox.commit(tx).await.unwrap();
@@ -72,14 +85,16 @@ async fn a_failing_handler_lets_the_retry_succeed() {
     let id = MessageId::try_from("m-1").unwrap();
 
     let failed = inbox
-        .process(&consumer, &id, |_conn| {
+        .consumer(consumer.clone())
+        .process(&id, |_conn| {
             Box::pin(async { Err::<(), _>("handler exploded".into()) })
         })
         .await;
     assert!(failed.is_err());
 
     let retried = inbox
-        .process(&consumer, &id, |_conn| Box::pin(async { Ok(42u8) }))
+        .consumer(consumer.clone())
+        .process(&id, |_conn| Box::pin(async { Ok(42u8) }))
         .await
         .unwrap();
     assert_eq!(retried, Outcome::Processed(42));
@@ -91,7 +106,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
     let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
-        .process(&consumer, &MessageId::try_from("old").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("old").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -105,7 +121,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .unwrap();
 
     inbox
-        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -116,7 +133,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
 
     // The recent entry survived, so it is still seen as a duplicate.
     let outcome = inbox
-        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -131,7 +149,8 @@ async fn purge_batches_across_multiple_passes() {
 
     for message in ["m-1", "m-2", "m-3"] {
         inbox
-            .process(&consumer, &MessageId::try_from(message).unwrap(), |_c| {
+            .consumer(consumer.clone())
+            .process(&MessageId::try_from(message).unwrap(), |_c| {
                 Box::pin(async { Ok(()) })
             })
             .await
@@ -192,7 +211,8 @@ async fn on_sqlite_the_loser_of_a_claim_race_is_refused_rather_than_blocked() {
         let id = id.clone();
         async move {
             inbox
-                .process(&consumer, &id, |_conn| {
+                .consumer(consumer.clone())
+                .process(&id, |_conn| {
                     Box::pin(async move {
                         tokio::time::sleep(HANDLER).await;
                         Ok::<_, txbox::HandlerError>(())
@@ -207,7 +227,8 @@ async fn on_sqlite_the_loser_of_a_claim_race_is_refused_rather_than_blocked() {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let result = inbox
-        .process(&consumer, &id, |_conn| Box::pin(async { Ok(()) }))
+        .consumer(consumer.clone())
+        .process(&id, |_conn| Box::pin(async { Ok(()) }))
         .await;
 
     // Asserting on the variant alone would also accept an unrelated backend

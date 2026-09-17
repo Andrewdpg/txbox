@@ -49,7 +49,8 @@ async fn duplicates_are_logged_at_debug_never_warn() {
     let id = MessageId::try_from("m-1").unwrap();
 
     inbox
-        .process(&consumer, &id, |_c| Box::pin(async { Ok(()) }))
+        .consumer(consumer.clone())
+        .process(&id, |_c| Box::pin(async { Ok(()) }))
         .await
         .unwrap();
 
@@ -63,7 +64,8 @@ async fn duplicates_are_logged_at_debug_never_warn() {
         // on other worker threads, since `set_default` is thread-local.
         let _guard = tracing::subscriber::set_default(spy);
         inbox
-            .process(&consumer, &id, |_c| Box::pin(async { Ok(()) }))
+            .consumer(consumer.clone())
+            .process(&id, |_c| Box::pin(async { Ok(()) }))
             .await
             .unwrap();
     }

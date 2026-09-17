@@ -20,6 +20,7 @@
 /// `txbox::sqlx` without declaring the dependency twice.
 pub use sqlx;
 
+mod consumer;
 mod error;
 #[cfg(feature = "postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
@@ -31,7 +32,8 @@ pub mod sqlite;
 mod store;
 mod types;
 
+pub use consumer::Consumer;
 pub use error::{HandlerError, InboxError, InvalidId};
 pub use retention::RetentionPolicy;
 pub use store::{BoxFuture, InboxExt, InboxStore};
-pub use types::{Claim, ConsumerId, MessageId, Outcome};
+pub use types::{Claim, ClaimRequest, ConsumerId, MessageId, Outcome};

@@ -68,6 +68,21 @@ pub enum InboxError {
     /// rolled back, so the message remains unprocessed and will be redelivered.
     #[error("inbox handler failure: {0}")]
     Handler(#[source] HandlerError),
+
+    /// [`Consumer::claim`](crate::Consumer::claim) could not acquire the row
+    /// within the configured [`with_lock_timeout`](crate::Consumer::with_lock_timeout).
+    ///
+    /// This means another consumer is claiming this exact message right now,
+    /// not that the backend has failed. The correct response is to let the
+    /// broker redeliver the message — **never** to dead-letter it: the
+    /// message itself is not malformed or errored, it is simply contended at
+    /// this instant, and the contending consumer is expected to commit and
+    /// leave the row valid for a normal duplicate check on redelivery.
+    ///
+    /// On PostgreSQL this maps from SQLSTATE `55P03` (`lock_not_available`),
+    /// which the backend raises when `SET LOCAL lock_timeout` expires.
+    #[error("inbox claim contended: lock timeout exceeded")]
+    Contended,
 }
 
 impl From<sqlx::Error> for InboxError {

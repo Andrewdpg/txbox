@@ -30,6 +30,11 @@ jobs:
 
       - run: cargo clippy --all-targets --features postgres,sqlite -- -D warnings
 
+      # The example lives behind its own feature, so neither the test run nor
+      # the lint above ever builds it. It is code people copy; it should not be
+      # the one file free to stop compiling.
+      - run: cargo check --example kafka_consumer --features example-kafka
+
       # The README is included as crate documentation, so a link that breaks in
       # it fails here rather than silently on docs.rs.
       - run: cargo doc --no-deps --features postgres,sqlite

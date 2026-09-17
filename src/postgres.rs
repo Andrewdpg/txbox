@@ -7,7 +7,11 @@ use tracing::Instrument;
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
 use crate::store::{BoxFuture, InboxStore};
-use crate::types::{Claim, ConsumerId, MessageId};
+use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId};
+
+/// PostgreSQL's SQLSTATE for `lock_not_available`, raised when
+/// `SET LOCAL lock_timeout` expires while waiting on a contended row.
+const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
@@ -33,6 +37,20 @@ const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                              WHERE processed_at < now() - make_interval(secs => $1) \
                              ORDER BY processed_at LIMIT $2 \
                          )";
+
+// `set_config` with `is_local = true` is the parameterisable equivalent of
+// `SET LOCAL lock_timeout = ...`: `SET` itself does not accept a bind
+// parameter over the wire protocol `sqlx` uses, but `set_config` is an
+// ordinary function call and does. `is_local = true` is what makes this
+// transaction-scoped rather than session-scoped: the setting reverts when
+// this transaction ends (commit or rollback), so it can never leak onto the
+// next caller of a connection returned to the pool.
+const SET_LOCK_TIMEOUT_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
+
+const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
+                                       SELECT 1 FROM inbox_messages \
+                                       WHERE consumer_id = $1 AND message_id = $2 \
+                                   )";
 
 /// An inbox backed by PostgreSQL.
 #[derive(Debug, Clone)]
@@ -78,9 +96,13 @@ impl InboxStore for PgInbox {
     fn claim<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
-        consumer: &'a ConsumerId,
-        id: &'a MessageId,
+        request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>> {
+        let ClaimRequest {
+            consumer,
+            id,
+            lock_timeout,
+        } = request;
         let span = tracing::debug_span!(
             "inbox.claim",
             consumer = %consumer,
@@ -89,18 +111,66 @@ impl InboxStore for PgInbox {
         );
         Box::pin(
             async move {
-                let affected = sqlx::query(CLAIM_SQL)
+                if let Some(timeout) = lock_timeout {
+                    // Scoped to this transaction via `is_local = true` — see
+                    // the comment on `SET_LOCK_TIMEOUT_SQL`. Must run before
+                    // the claim INSERT below, which is the statement it is
+                    // meant to bound.
+                    sqlx::query(SET_LOCK_TIMEOUT_SQL)
+                        .bind(format!("{}ms", timeout.as_millis()))
+                        .execute(&mut *conn)
+                        .await?;
+                }
+
+                let result = sqlx::query(CLAIM_SQL)
                     .bind(consumer.as_str())
                     .bind(id.as_str())
                     .execute(&mut *conn)
-                    .await?
-                    .rows_affected();
+                    .await;
+
+                let affected = match result {
+                    Ok(done) => done.rows_affected(),
+                    Err(sqlx::Error::Database(db_err))
+                        if db_err.code().as_deref() == Some(LOCK_NOT_AVAILABLE) =>
+                    {
+                        return Err(InboxError::Contended);
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 Ok(if affected == 1 {
                     Claim::Fresh
                 } else {
                     Claim::Duplicate
                 })
+            }
+            .instrument(span),
+        )
+    }
+
+    fn is_known_duplicate<'a>(
+        &'a self,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<bool, InboxError>> {
+        let span = tracing::debug_span!(
+            "inbox.is_known_duplicate",
+            consumer = %consumer,
+            message_id = %id,
+            backend = "postgres"
+        );
+        Box::pin(
+            async move {
+                // Deliberately on the pool rather than in a transaction: the
+                // point is to answer without opening one. A row read here is
+                // committed, which is what makes the `true` answer safe.
+                let known: bool = sqlx::query_scalar(KNOWN_DUPLICATE_SQL)
+                    .bind(consumer.as_str())
+                    .bind(id.as_str())
+                    .fetch_one(&self.pool)
+                    .await?;
+
+                Ok(known)
             }
             .instrument(span),
         )

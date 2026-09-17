@@ -135,11 +135,11 @@ let pool = PgPoolOptions::new()
 let inbox = PgInbox::new(pool);
 inbox.migrate().await?; // explicit — see "Migrations" below
 
-let consumer = ConsumerId::try_from("orders-billing")?;
+let orders = inbox.consumer(ConsumerId::try_from("orders-billing")?);
 let id = MessageId::try_from("msg-123")?;
 
-let outcome = inbox
-    .process(&consumer, &id, |conn| {
+let outcome = orders
+    .process(&id, |conn| {
         Box::pin(async move {
             sqlx::query("INSERT INTO orders (payload) VALUES ($1)")
                 .bind("...")
@@ -157,8 +157,15 @@ match outcome {
 Ok(()) }
 ```
 
-Import both: `InboxStore` for `purge`, `InboxExt` for `process` —
-`InboxExt` is an extension trait, blanket-implemented for every store.
+Import both: `InboxStore` for `migrate` and `purge`, `InboxExt` for
+`consumer` — `InboxExt` is an extension trait, blanket-implemented for
+every store.
+
+A [`Consumer`] is one logical consumer of one stream. It carries its own
+identifier, so that identifier is settled once instead of being passed on
+every call, and its own tuning, so two queues sharing a pool can be
+configured independently. `migrate` and `purge` stay on the backend: they
+belong to the database, not to a queue.
 
 ## Migrations
 
@@ -199,24 +206,22 @@ CREATE INDEX IF NOT EXISTS idx_inbox_processed_at
 ## Batching
 
 `process` opens a transaction per message, so a high-volume consumer pays
-one commit — and one fsync — per message. `claim` is public and takes the
-backend connection directly, so a caller can claim a whole batch inside a
-single transaction instead:
+one commit — and one fsync — per message. A consumer also exposes the
+transaction directly, so a caller can claim a whole batch inside one:
 
 ```rust
 use txbox::postgres::PgInbox;
 use txbox::sqlx;
-use txbox::{Claim, ConsumerId, InboxStore, MessageId};
+use txbox::{Claim, Consumer, MessageId};
 
 async fn run(
-    inbox: &PgInbox,
-    consumer: &ConsumerId,
+    orders: &Consumer<PgInbox>,
     batch: &[MessageId],
 ) -> Result<(), Box<dyn std::error::Error>> {
-let mut tx = inbox.begin().await?;
+let mut tx = orders.begin().await?;
 
 for id in batch {
-    if inbox.claim(&mut tx, consumer, id).await? == Claim::Fresh {
+    if orders.claim(&mut tx, id).await? == Claim::Fresh {
         sqlx::query("INSERT INTO orders (message_id) VALUES ($1)")
             .bind(id.as_str())
             .execute(&mut *tx)
@@ -224,7 +229,7 @@ for id in batch {
     }
 }
 
-inbox.commit(tx).await?;
+orders.commit(tx).await?;
 Ok(()) }
 ```
 
@@ -249,6 +254,91 @@ To abandon a batch, drop the transaction: that rolls it back. `InboxStore`
 has no explicit rollback, so generic code relies on the drop; code written
 against a concrete backend can call `rollback()` on the transaction
 itself.
+
+## Sizing
+
+`process` holds its transaction — and therefore a pooled connection — for
+the whole handler. That is the price of the guarantee: the inbox row and
+the handler's effects must commit together, so the connection cannot go
+back to the pool while the handler is still working.
+
+That makes throughput arithmetic. With `P` connections and a handler
+taking `H`, no more than `P/H` messages complete per second, however many
+tasks are pushing. Measured with a pool of 8 and a 25 ms handler, against
+an arithmetic ceiling of 320 msg/s:
+
+| workers | throughput | p50 latency |
+|---|---|---|
+| 4  | 148 msg/s (46% of ceiling) | 27 ms |
+| 8  | 291 msg/s (91%) | 27 ms |
+| 16 | 289 msg/s (90%) | 55 ms |
+| 32 | 291 msg/s (91%) | 110 ms |
+| 64 | 292 msg/s (91%) | 218 ms |
+
+Throughput stops at the pool. Latency does not: it doubles with every
+doubling of the worker count, because each message waits behind the
+others for a connection. At 64 workers over 8 connections a message waits
+out eight handlers before its own runs.
+
+**Size the worker count to the pool, not to the machine.** Workers past
+the pool buy queueing and nothing else. If you need more throughput,
+raise `max_connections` or shorten the handler — those are the only two
+terms in the ceiling.
+
+### Contention
+
+A consumer that loses a claim race waits for the winner's transaction,
+which means it waits out the winner's handler — and holds its own pooled
+connection the whole time it waits. It is fair to wonder whether that
+compounds when several consumers race at once. It does not:
+
+| contenders | winner | slowest loser |
+|---|---|---|
+| 2  | 508 ms | 509 ms |
+| 4  | 506 ms | 506 ms |
+| 8  | 503 ms | 503 ms |
+| 16 | 503 ms | 504 ms |
+
+The losers all wait on the same uncommitted row, wake together when the
+winner commits, and then find a committed row and skip immediately. A
+rebalance storm that delivers one message to sixteen consumers costs one
+handler, not sixteen.
+
+The caveat is the pool again: every blocked loser is holding a connection
+while it waits. Contention does not multiply the delay, but it does
+occupy connections for the duration — with an 8-connection pool and a
+70-second handler, eight contenders parked for 70 seconds each exhausts
+the pool outright.
+
+`Consumer::with_lock_timeout` converts that wait into a fast, explicit
+error instead of a block:
+
+```rust
+# use sqlx::PgPool;
+use std::time::Duration;
+use txbox::postgres::PgInbox;
+use txbox::{ConsumerId, InboxExt};
+
+# fn build(pool: PgPool) -> Result<(), txbox::InvalidId> {
+let db = PgInbox::new(pool);
+let orders = db
+    .consumer(ConsumerId::try_from("orders")?)
+    .with_lock_timeout(Duration::from_millis(200));
+# let _ = orders;
+# Ok(()) }
+```
+
+On PostgreSQL, this issues `SET LOCAL lock_timeout` inside the claiming
+transaction, so a consumer that cannot acquire a contended row within the
+timeout gets `InboxError::Contended` back instead of blocking for the
+winner's handler. `Contended` means another consumer is processing this
+exact message right now — the broker will redeliver it, so the correct
+response is to let that happen, never to dead-letter it.
+
+This is unset by default, preserving the blocking behaviour described
+above. It is also a no-op on SQLite: SQLite's equivalent is
+connection-level (`SqliteConnectOptions::busy_timeout`), which belongs to
+the pool the caller builds, not to a single consumer's configuration.
 
 ## Retention
 
@@ -288,6 +378,38 @@ On SQLite the timestamp still comes from the calling process, because
 there is nowhere else for it to come from: SQLite runs inside that
 process, so its clock *is* the caller's clock and the skew described
 above cannot arise.
+
+### What retention costs
+
+Measured by filling the inbox to 300 000 rows and sampling as it grew:
+
+| rows | table | index | claim p50 |
+|---|---|---|---|
+| 50 000  |  5.1 MB |  2.1 MB | 456 µs |
+| 150 000 | 15.5 MB |  6.8 MB | 456 µs |
+| 300 000 | 31.0 MB | 13.6 MB | 448 µs |
+
+Growth is linear at roughly 150 bytes per retained message across table
+and index together, so a week of retention at ten messages a second is
+about 900 MB. **Claiming does not get slower as the table grows** — the
+median held between 409 µs and 465 µs across the whole range, which is
+noise. A btree deepens logarithmically, and 300 000 rows do not move it.
+
+Purging removed 301 200 rows in 781 ms, near 385 000 rows a second. The
+purge will not be your bottleneck.
+
+What does deserve attention is that **`DELETE` reclaims nothing on its
+own**. After the purge above, the table still occupied its full 31 MB
+until `VACUUM` ran. Autovacuum normally handles this, but the shape of
+the recovery is worth knowing: `VACUUM` truncated the table to 16 MB
+because this run deleted every row and left empty pages at the end of the
+file, while the index did not shrink at all — its pages are marked
+reusable and stay put.
+
+A live inbox never has that shape. Retention deletes the oldest rows
+while new ones are appended, so the freed space sits in the middle of the
+file and is reused rather than returned. **Size the disk for what
+retention holds, and do not expect a purge to shrink anything.**
 
 ## Purge scheduling
 

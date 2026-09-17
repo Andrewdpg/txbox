@@ -8,7 +8,7 @@ use tracing::Instrument;
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
 use crate::store::{BoxFuture, InboxStore};
-use crate::types::{Claim, ConsumerId, MessageId};
+use crate::types::{Claim, ClaimRequest};
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
@@ -74,9 +74,14 @@ impl InboxStore for SqliteInbox {
     fn claim<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
-        consumer: &'a ConsumerId,
-        id: &'a MessageId,
+        request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>> {
+        // `request.lock_timeout` is a no-op here: SQLite has no
+        // per-transaction lock timeout. The equivalent is connection-level
+        // (`SqliteConnectOptions::busy_timeout`), which belongs to the pool
+        // the caller builds, not to a single consumer's configuration. See
+        // `Consumer::with_lock_timeout`.
+        let ClaimRequest { consumer, id, .. } = request;
         let span = tracing::debug_span!(
             "inbox.claim",
             consumer = %consumer,

@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use txbox::{
-    BoxFuture, Claim, ConsumerId, InboxError, InboxExt, InboxStore, MessageId, Outcome,
-    RetentionPolicy,
+    BoxFuture, Claim, ClaimRequest, Consumer, ConsumerId, InboxError, InboxExt, InboxStore,
+    MessageId, Outcome, RetentionPolicy,
 };
 
 /// A fake connection that records the business effects applied to it.
@@ -33,10 +33,13 @@ impl DerefMut for FakeTx {
     }
 }
 
-#[derive(Default)]
+/// Cloned by `consumer()`, so the recorded state is shared rather than copied:
+/// a clone that forgot what the original had seen would report every message as
+/// fresh and quietly invalidate these tests.
+#[derive(Default, Clone)]
 struct FakeStore {
-    seen: Mutex<HashSet<(String, String)>>,
-    committed: Mutex<Vec<String>>,
+    seen: Arc<Mutex<HashSet<(String, String)>>>,
+    committed: Arc<Mutex<Vec<String>>>,
 }
 
 impl InboxStore for FakeStore {
@@ -66,15 +69,13 @@ impl InboxStore for FakeStore {
     fn claim<'a>(
         &'a self,
         _conn: &'a mut FakeConn,
-        consumer: &'a ConsumerId,
-        id: &'a MessageId,
+        request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>> {
         Box::pin(async move {
-            let inserted = self
-                .seen
-                .lock()
-                .unwrap()
-                .insert((consumer.as_str().to_owned(), id.as_str().to_owned()));
+            let inserted = self.seen.lock().unwrap().insert((
+                request.consumer.as_str().to_owned(),
+                request.id.as_str().to_owned(),
+            ));
             Ok(if inserted {
                 Claim::Fresh
             } else {
@@ -88,14 +89,17 @@ impl InboxStore for FakeStore {
     }
 }
 
+fn billing(store: &FakeStore) -> Consumer<FakeStore> {
+    store.consumer(ConsumerId::try_from("billing").unwrap())
+}
+
 #[tokio::test]
 async fn first_delivery_runs_the_handler() {
     let store = FakeStore::default();
-    let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
-    let outcome = store
-        .process(&consumer, &id, |conn| {
+    let outcome = billing(&store)
+        .process(&id, |conn| {
             Box::pin(async move {
                 conn.effects.push("charged".to_owned());
                 Ok(1u8)
@@ -111,11 +115,10 @@ async fn first_delivery_runs_the_handler() {
 #[tokio::test]
 async fn second_delivery_is_skipped_and_the_handler_never_runs() {
     let store = FakeStore::default();
-    let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
-    store
-        .process(&consumer, &id, |conn| {
+    billing(&store)
+        .process(&id, |conn| {
             Box::pin(async move {
                 conn.effects.push("charged".to_owned());
                 Ok(1u8)
@@ -124,8 +127,8 @@ async fn second_delivery_is_skipped_and_the_handler_never_runs() {
         .await
         .unwrap();
 
-    let outcome = store
-        .process::<_, u8>(&consumer, &id, |_conn| {
+    let outcome = billing(&store)
+        .process::<_, u8>(&id, |_conn| {
             Box::pin(async { panic!("handler must not run for a duplicate") })
         })
         .await
@@ -140,9 +143,10 @@ async fn distinct_consumers_both_process_the_same_message() {
     let store = FakeStore::default();
     let id = MessageId::try_from("m-1").unwrap();
 
-    for consumer in ["billing", "notifications"] {
+    for name in ["billing", "notifications"] {
         let outcome = store
-            .process(&ConsumerId::try_from(consumer).unwrap(), &id, |conn| {
+            .consumer(ConsumerId::try_from(name).unwrap())
+            .process(&id, |conn| {
                 Box::pin(async move {
                     conn.effects.push("handled".to_owned());
                     Ok(())
@@ -160,17 +164,13 @@ async fn distinct_consumers_both_process_the_same_message() {
 async fn a_failing_handler_discards_the_effect() {
     let store = FakeStore::default();
 
-    let result = store
-        .process(
-            &ConsumerId::try_from("billing").unwrap(),
-            &MessageId::try_from("m-1").unwrap(),
-            |conn| {
-                Box::pin(async move {
-                    conn.effects.push("charged".to_owned());
-                    Err::<(), _>("boom".into())
-                })
-            },
-        )
+    let result = billing(&store)
+        .process(&MessageId::try_from("m-1").unwrap(), |conn| {
+            Box::pin(async move {
+                conn.effects.push("charged".to_owned());
+                Err::<(), _>("boom".into())
+            })
+        })
         .await;
 
     assert!(matches!(result, Err(InboxError::Handler(_))));

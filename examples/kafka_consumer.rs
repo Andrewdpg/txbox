@@ -23,12 +23,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inbox = PgInbox::new(pool);
     inbox.migrate().await?;
 
-    // The consumer id namespaces the inbox. Two services consuming the same
-    // topic MUST use different values, or the second will skip every message
-    // the first has already handled.
-    let consumer_id = ConsumerId::try_from("orders-billing")?;
+    // One handle per queue, built once. The identifier is settled here instead
+    // of being passed on every message, and tuning lives here too — so another
+    // queue sharing this pool is unaffected by how this one is configured.
+    //
+    // Two services consuming the same topic MUST use different identifiers, or
+    // the second will skip every message the first has already handled.
+    let orders = inbox.consumer(ConsumerId::try_from("orders-billing")?);
 
-    let consumer: StreamConsumer = ClientConfig::new()
+    let kafka: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
         .set("group.id", "orders-billing")
         // Offsets are committed by hand, only after the inbox transaction has
@@ -39,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // the very guarantee this crate exists to provide.
         .set("enable.auto.commit", "false")
         .create()?;
-    consumer.subscribe(&["orders.created"])?;
+    kafka.subscribe(&["orders.created"])?;
 
     // Purging runs on one instance only. With N replicas, N in-process loops
     // would compete to delete the same rows; prefer a scheduled job instead.
@@ -63,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // propagates every error with `?` and exits instead, only to stay
     // readable — do not copy that part into production code.
     loop {
-        let message = consumer.recv().await?;
+        let message = kafka.recv().await?;
 
         // The only broker-specific line in the whole program: pick a stable
         // identifier. A producer-supplied key is better than the offset,
@@ -78,15 +81,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(Ok(id)) => id,
             rejected => {
                 tracing::error!(?rejected, "unprocessable message id, skipping");
-                consumer.commit_message(&message, CommitMode::Async)?;
+                kafka.commit_message(&message, CommitMode::Async)?;
                 continue;
             }
         };
 
         let payload = message.payload().unwrap_or_default().to_vec();
 
-        let outcome = inbox
-            .process(&consumer_id, &id, move |conn| {
+        let outcome = orders
+            .process(&id, move |conn| {
                 Box::pin(async move {
                     sqlx::query("INSERT INTO orders (payload) VALUES ($1)")
                         .bind(&payload[..])
@@ -106,6 +109,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // points is safe and expected: the broker redelivers, and the inbox
         // recognises the message as a duplicate. That window is precisely what the
         // inbox pattern exists to make harmless.
-        consumer.commit_message(&message, CommitMode::Async)?;
+        kafka.commit_message(&message, CommitMode::Async)?;
     }
 }

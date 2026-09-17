@@ -10,7 +10,7 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use txbox::postgres::PgInbox;
-use txbox::{ConsumerId, InboxExt, MessageId, Outcome};
+use txbox::{ConsumerId, InboxError, InboxExt, MessageId, Outcome};
 
 /// The container handle must stay alive for as long as the pool is used;
 /// dropping it stops the database.
@@ -61,7 +61,8 @@ async fn concurrent_delivery_applies_the_effect_exactly_once() {
 
         handles.push(tokio::spawn(async move {
             inbox
-                .process(&consumer, &id, |conn| {
+                .consumer(consumer.clone())
+                .process(&id, |conn| {
                     Box::pin(async move {
                         sqlx::query("INSERT INTO effects (message_id) VALUES ('contended-1')")
                             .execute(&mut *conn)
@@ -126,7 +127,8 @@ async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
         let id = id.clone();
         async move {
             inbox
-                .process(&consumer, &id, |_conn| {
+                .consumer(consumer.clone())
+                .process(&id, |_conn| {
                     Box::pin(async move {
                         tokio::time::sleep(HANDLER).await;
                         Ok::<_, txbox::HandlerError>(())
@@ -141,7 +143,8 @@ async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
 
     let started = Instant::now();
     let outcome = inbox
-        .process(&consumer, &id, |_conn| Box::pin(async { Ok(()) }))
+        .consumer(consumer.clone())
+        .process(&id, |_conn| Box::pin(async { Ok(()) }))
         .await
         .expect("no inbox error");
     let waited = started.elapsed();
@@ -165,4 +168,100 @@ async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
         "the loser returned after {waited:?}, which is less than {floor:?}: \
          it did not block on the winner's transaction"
     );
+}
+
+// A test previously lived here asserting that the (now-removed) duplicate
+// fast path still applied the effect exactly once under a race. `process`
+// no longer has a fast path to race against — it always takes claim's
+// transactional path — so that scenario no longer exists. The property it
+// was guarding (`claim` arbitrates a race correctly) is already covered by
+// `concurrent_delivery_applies_the_effect_exactly_once` above, which doesn't
+// depend on the removed toggle at all.
+
+/// `with_lock_timeout` exists to turn the blocking wait proven above into a
+/// fast, explicit error. Consumer A claims the row and holds its transaction
+/// open for a long handler; consumer B, configured with a short lock
+/// timeout, must come back with `InboxError::Contended` quickly rather than
+/// waiting out A's handler. Once A commits, B's retry must see a plain
+/// duplicate.
+///
+/// The assertion on `waited` is deliberately tight around the timeout rather
+/// than the handler duration — the whole point is that B does *not* wait
+/// anywhere near `HANDLER`. A timing-free assertion (checking only the
+/// error variant) would pass even if `SET LOCAL lock_timeout` were silently
+/// dropped and B blocked for the full handler, so it would not catch that
+/// regression.
+#[tokio::test]
+async fn a_short_lock_timeout_returns_contended_quickly_instead_of_blocking() {
+    const HANDLER: Duration = Duration::from_secs(5);
+    const CLAIM_HEADSTART: Duration = Duration::from_millis(250);
+    const LOCK_TIMEOUT: Duration = Duration::from_millis(200);
+
+    let (_container, _pool, inbox) = inbox().await;
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("contended-4").unwrap();
+
+    let winner = tokio::spawn({
+        let inbox = Arc::clone(&inbox);
+        let consumer = consumer.clone();
+        let id = id.clone();
+        async move {
+            inbox
+                .consumer(consumer.clone())
+                .process(&id, |_conn| {
+                    Box::pin(async move {
+                        tokio::time::sleep(HANDLER).await;
+                        Ok::<_, txbox::HandlerError>(())
+                    })
+                })
+                .await
+        }
+    });
+
+    // Let the winner take the row before the contended consumer attempts it.
+    tokio::time::sleep(CLAIM_HEADSTART).await;
+
+    let contended = inbox
+        .consumer(consumer.clone())
+        .with_lock_timeout(LOCK_TIMEOUT);
+
+    let started = Instant::now();
+    let result = contended
+        .process(&id, |_conn| Box::pin(async { Ok(()) }))
+        .await;
+    let waited = started.elapsed();
+
+    match result {
+        Err(InboxError::Contended) => {}
+        other => panic!("expected InboxError::Contended, got {other:?}"),
+    }
+
+    // The floor is well under HANDLER: a regression that fell back to
+    // blocking would take seconds, not tens of milliseconds. The ceiling
+    // gives CI jitter room without letting a multi-second block sneak past.
+    assert!(
+        waited < HANDLER / 2,
+        "the contended claim returned after {waited:?}, which is not \
+         meaningfully faster than the {HANDLER:?} handler it should have \
+         avoided waiting for — the lock timeout did not take effect"
+    );
+
+    assert_eq!(
+        winner
+            .await
+            .expect("task did not panic")
+            .expect("no inbox error"),
+        Outcome::Processed(()),
+        "the winner must still process the message"
+    );
+
+    // Now that the winner has committed, the row exists and the retry finds
+    // a plain, already-processed duplicate — no contention left to hit.
+    let retried = inbox
+        .consumer(consumer.clone())
+        .with_lock_timeout(LOCK_TIMEOUT)
+        .process(&id, |_conn| Box::pin(async { Ok(()) }))
+        .await
+        .expect("no inbox error");
+    assert_eq!(retried, Outcome::Skipped, "the retry must see a duplicate");
 }

@@ -9,7 +9,9 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use txbox::postgres::PgInbox;
-use txbox::{Claim, ConsumerId, InboxExt, InboxStore, MessageId, Outcome, RetentionPolicy};
+use txbox::{
+    Claim, ClaimRequest, ConsumerId, InboxExt, InboxStore, MessageId, Outcome, RetentionPolicy,
+};
 
 /// The container handle must stay alive for as long as the pool is used;
 /// dropping it stops the database.
@@ -41,14 +43,20 @@ async fn claim_is_fresh_once_then_duplicate() {
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Fresh
     );
     inbox.commit(tx).await.unwrap();
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Duplicate
     );
     inbox.commit(tx).await.unwrap();
@@ -61,9 +69,8 @@ async fn distinct_consumers_both_process_the_same_message() {
 
     for consumer in ["billing", "notifications"] {
         let outcome = inbox
-            .process(&ConsumerId::try_from(consumer).unwrap(), &id, |_c| {
-                Box::pin(async { Ok(()) })
-            })
+            .consumer(ConsumerId::try_from(consumer).unwrap())
+            .process(&id, |_c| Box::pin(async { Ok(()) }))
             .await
             .unwrap();
         assert_eq!(outcome, Outcome::Processed(()));
@@ -76,7 +83,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
     let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
-        .process(&consumer, &MessageId::try_from("old").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("old").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -89,7 +97,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
         .unwrap();
 
     inbox
-        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -99,7 +108,8 @@ async fn purge_deletes_only_entries_outside_the_window() {
     assert_eq!(inbox.purge(&policy).await.unwrap(), 1);
 
     let outcome = inbox
-        .process(&consumer, &MessageId::try_from("new").unwrap(), |_c| {
+        .consumer(consumer.clone())
+        .process(&MessageId::try_from("new").unwrap(), |_c| {
             Box::pin(async { Ok(()) })
         })
         .await
@@ -126,7 +136,10 @@ async fn processed_at_comes_from_the_database_clock() {
 
     let mut tx = inbox.begin().await.unwrap();
     assert_eq!(
-        inbox.claim(&mut tx, &consumer, &id).await.unwrap(),
+        inbox
+            .claim(&mut tx, ClaimRequest::new(&consumer, &id))
+            .await
+            .unwrap(),
         Claim::Fresh
     );
 
@@ -211,7 +224,12 @@ async fn a_duplicate_inside_one_batch_is_caught_before_the_commit() {
     let mut tx = inbox.begin().await.unwrap();
     let mut claims = Vec::new();
     for id in &batch {
-        claims.push(inbox.claim(&mut tx, &consumer, id).await.unwrap());
+        claims.push(
+            inbox
+                .claim(&mut tx, ClaimRequest::new(&consumer, id))
+                .await
+                .unwrap(),
+        );
     }
     inbox.commit(tx).await.unwrap();
 
@@ -232,7 +250,10 @@ async fn a_batch_that_rolls_back_leaves_every_message_unclaimed() {
     let mut tx = inbox.begin().await.unwrap();
     for id in &batch {
         assert_eq!(
-            inbox.claim(&mut tx, &consumer, id).await.unwrap(),
+            inbox
+                .claim(&mut tx, ClaimRequest::new(&consumer, id))
+                .await
+                .unwrap(),
             Claim::Fresh
         );
     }
@@ -241,10 +262,45 @@ async fn a_batch_that_rolls_back_leaves_every_message_unclaimed() {
     for id in &batch {
         let mut tx = inbox.begin().await.unwrap();
         assert_eq!(
-            inbox.claim(&mut tx, &consumer, id).await.unwrap(),
+            inbox
+                .claim(&mut tx, ClaimRequest::new(&consumer, id))
+                .await
+                .unwrap(),
             Claim::Fresh,
             "a rolled back batch must leave {id} redeliverable"
         );
         inbox.commit(tx).await.unwrap();
     }
+}
+
+/// `is_known_duplicate` is a plain read outside any transaction, kept as an
+/// explicitly-called method for replay and backfill scenarios. A committed
+/// inbox row can never become uncommitted, so a read that finds one is
+/// definitive; a read that finds nothing proves nothing — the message may be
+/// fresh, or a concurrent claim may be in flight — so a caller relying on this
+/// method rather than `process` must still treat `false` as "unknown", never
+/// "fresh".
+///
+/// That asymmetry is the entire contract, and it is why the answer is
+/// reported as "known duplicate" rather than "duplicate".
+#[tokio::test]
+async fn a_committed_claim_is_a_known_duplicate() {
+    let (_container, db) = inbox().await;
+    let billing = db.consumer(ConsumerId::try_from("billing").unwrap());
+    let id = MessageId::try_from("m-1").unwrap();
+
+    assert!(
+        !billing.is_known_duplicate(&id).await.unwrap(),
+        "an unseen message cannot be known to be a duplicate"
+    );
+
+    billing
+        .process(&id, |_c| Box::pin(async { Ok(()) }))
+        .await
+        .unwrap();
+
+    assert!(
+        billing.is_known_duplicate(&id).await.unwrap(),
+        "a committed claim must be visible to is_known_duplicate"
+    );
 }
