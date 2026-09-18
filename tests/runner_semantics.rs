@@ -134,7 +134,7 @@ async fn second_delivery_is_skipped_and_the_handler_never_runs() {
         .await
         .unwrap();
 
-    assert_eq!(outcome, Outcome::Skipped);
+    assert_eq!(outcome, Outcome::Duplicate);
     assert_eq!(store.committed.lock().unwrap().len(), 1);
 }
 

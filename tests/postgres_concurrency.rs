@@ -83,7 +83,7 @@ async fn concurrent_delivery_applies_the_effect_exactly_once() {
             .expect("no inbox error")
         {
             Outcome::Processed(()) => processed += 1,
-            Outcome::Skipped => skipped += 1,
+            Outcome::Duplicate => skipped += 1,
         }
     }
 
@@ -149,7 +149,7 @@ async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
         .expect("no inbox error");
     let waited = started.elapsed();
 
-    assert_eq!(outcome, Outcome::Skipped, "the loser must skip");
+    assert_eq!(outcome, Outcome::Duplicate, "the loser must skip");
     assert_eq!(
         winner
             .await
@@ -263,5 +263,9 @@ async fn a_short_lock_timeout_returns_contended_quickly_instead_of_blocking() {
         .process(&id, |_conn| Box::pin(async { Ok(()) }))
         .await
         .expect("no inbox error");
-    assert_eq!(retried, Outcome::Skipped, "the retry must see a duplicate");
+    assert_eq!(
+        retried,
+        Outcome::Duplicate,
+        "the retry must see a duplicate"
+    );
 }

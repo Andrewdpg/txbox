@@ -84,7 +84,7 @@ of just trusting it.
 | Consumer crashes after the business effect commits, before the offset commits | Broker redelivers; insert runs again — effect applied twice | Broker redelivers; `claim` finds the row already present, handler doesn't run — effect applied once |
 | Partition rebalance redelivers an already-processed batch | Every message in the batch is reapplied | Each message is skipped as a duplicate; only genuinely new ones run the handler |
 | The handler fails partway through | Same in both: the broker's own delivery semantics decide whether it retries — `txbox` doesn't change this | Same in both, but if it does retry, the aborted attempt left no partial row (transaction rolled back), so the retry is treated as fresh, not as a duplicate |
-| Same message delivered concurrently to two instances of the same consumer | Both instances see no prior record and both apply the effect — a race, not a possibility | One claims the row and proceeds; the other loses the race and skips (`tests/postgres_concurrency.rs` asserts exactly one `Processed` and one `Skipped` for a concurrent pair on PostgreSQL) |
+| Same message delivered concurrently to two instances of the same consumer | Both instances see no prior record and both apply the effect — a race, not a possibility | One claims the row and proceeds; the other loses the race and skips (`tests/postgres_concurrency.rs` asserts exactly one `Processed` and one `Duplicate` for a concurrent pair on PostgreSQL) |
 | Two different services consume the same topic | Neither has any dedup signal at all; both simply run their own logic | Only correct if each service uses its own `ConsumerId` — the dedup key is `(consumer_id, message_id)`, so two services sharing one `ConsumerId` will see the second service's messages silently skipped as duplicates it never actually ran |
 
 None of this extends past the connection `process()` hands the handler. As
@@ -152,7 +152,7 @@ let outcome = orders
 
 match outcome {
     Outcome::Processed(()) => println!("handled"),
-    Outcome::Skipped => println!("duplicate, ignored"),
+    Outcome::Duplicate => println!("duplicate, ignored"),
 }
 Ok(()) }
 ```

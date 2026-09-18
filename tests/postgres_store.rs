@@ -114,7 +114,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
         })
         .await
         .unwrap();
-    assert_eq!(outcome, Outcome::Skipped);
+    assert_eq!(outcome, Outcome::Duplicate);
 }
 
 /// Retention is a temporal invariant: `max_age` must exceed the broker's

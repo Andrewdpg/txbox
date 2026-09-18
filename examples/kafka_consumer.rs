@@ -102,7 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match outcome {
             Outcome::Processed(()) => tracing::info!(%id, "order stored"),
-            Outcome::Skipped => tracing::debug!(%id, "duplicate ignored"),
+            Outcome::Duplicate => tracing::debug!(%id, "duplicate ignored"),
         }
 
         // Commit only after the transaction committed. Crashing between these two

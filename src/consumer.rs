@@ -148,13 +148,17 @@ impl<S: InboxStore> Consumer<S> {
 
                 match self.store.claim(&mut tx, request).await? {
                     Claim::Duplicate => {
+                        // A dedicated target lets an operator watch duplicate
+                        // volume in production (`RUST_LOG=txbox::duplicate=debug`)
+                        // without enabling debug logging for the whole crate.
                         tracing::debug!(
+                            target: "txbox::duplicate",
                             consumer = %self.id,
                             message_id = %id,
                             "duplicate message skipped"
                         );
                         // Dropping the transaction rolls it back. Nothing to keep.
-                        Ok(Outcome::Skipped)
+                        Ok(Outcome::Duplicate)
                     }
                     Claim::Fresh => {
                         let value = handler(&mut tx).await.map_err(InboxError::Handler)?;

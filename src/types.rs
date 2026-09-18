@@ -11,6 +11,15 @@ use crate::error::InvalidId;
 pub struct ConsumerId(String);
 
 /// Identifies a single message, as supplied by the broker or the producer.
+///
+/// A raw sequence number is only unique *within the producer that emitted
+/// it*. When several producers publish to one queue and each numbers
+/// messages with its own local sequence, two of them can legitimately emit
+/// the same raw id — and the second is discarded as a duplicate it never
+/// actually was. This mirrors the risk documented on [`ConsumerId`]: sharing
+/// one dedup key across independent sources loses information silently
+/// rather than failing loudly. Use [`MessageId::scoped`] to fold the
+/// producer's identity into the key and avoid the collision.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId(String);
 
@@ -30,8 +39,14 @@ macro_rules! string_newtype {
             type Error = InvalidId;
 
             fn try_from(value: String) -> Result<Self, InvalidId> {
-                if value.is_empty() {
+                if value.trim().is_empty() {
+                    // Catches both "" and whitespace-only values: either way
+                    // the id is blank, and that is the more useful report
+                    // than SurroundingWhitespace.
                     return Err(InvalidId::Empty);
+                }
+                if value.trim().len() != value.len() {
+                    return Err(InvalidId::SurroundingWhitespace);
                 }
                 if value.len() > Self::MAX_LEN {
                     return Err(InvalidId::TooLong {
@@ -61,6 +76,52 @@ macro_rules! string_newtype {
 
 string_newtype!(ConsumerId, 255);
 string_newtype!(MessageId, 512);
+
+impl MessageId {
+    /// Builds a message id scoped to `scope`, joining the two with `':'`.
+    ///
+    /// Use this when several producers publish to one queue and each numbers
+    /// messages with its own local sequence: two producers can legitimately
+    /// emit the same raw id, and without a scope the second is silently
+    /// discarded as a duplicate of the first. See the type-level docs on
+    /// [`MessageId`] for the full risk.
+    ///
+    /// `scope` and `id` are each rejected if blank (empty or whitespace-only,
+    /// reported as [`InvalidId::Empty`]) or surrounded by whitespace
+    /// (reported as [`InvalidId::SurroundingWhitespace`]) — checked on each
+    /// part individually, not on the joined string, because whitespace
+    /// sitting right against the `':'` separator (e.g. a trailing space in
+    /// `scope`, or a leading one in `id`) would not be at either edge of the
+    /// joined value and would otherwise slip through silently. A scope like
+    /// `" mt5"` is rejected rather than joined into a different key than
+    /// `"mt5"` would have produced — see
+    /// [`InvalidId::SurroundingWhitespace`] for why this crate refuses
+    /// rather than trims. The joined value must also respect
+    /// [`MessageId::MAX_LEN`], enforced by [`MessageId::try_from`].
+    ///
+    /// The `':'` separator is rejected in `scope` but allowed in `id`. This
+    /// asymmetry is deliberate, not an oversight: without it,
+    /// `scoped("a:b", "c")` and `scoped("a", "b:c")` would both join to
+    /// `"a:b:c"` and collide. A scope is a short, controlled identifier — a
+    /// producer, an app, a tenant — that has no legitimate reason to contain
+    /// a colon. A message id can: Kafka users commonly compose
+    /// `topic:partition:offset` as their raw id, and that must pass through
+    /// unscathed.
+    pub fn scoped(scope: &str, id: &str) -> Result<Self, InvalidId> {
+        if scope.contains(':') {
+            return Err(InvalidId::ScopeContainsSeparator);
+        }
+        for part in [scope, id] {
+            if part.trim().is_empty() {
+                return Err(InvalidId::Empty);
+            }
+            if part.trim().len() != part.len() {
+                return Err(InvalidId::SurroundingWhitespace);
+            }
+        }
+        Self::try_from(format!("{scope}:{id}"))
+    }
+}
 
 /// The result of attempting to record a message in the inbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,15 +187,15 @@ pub enum Outcome<T> {
     /// The handler ran and produced this value.
     Processed(T),
     /// The message was a duplicate; the handler did not run.
-    Skipped,
+    Duplicate,
 }
 
 impl<T> Outcome<T> {
-    /// Returns the handler's value, or `None` if the message was skipped.
+    /// Returns the handler's value, or `None` if the message was a duplicate.
     pub fn processed(self) -> Option<T> {
         match self {
             Outcome::Processed(value) => Some(value),
-            Outcome::Skipped => None,
+            Outcome::Duplicate => None,
         }
     }
 }
@@ -172,6 +233,36 @@ mod tests {
     }
 
     #[test]
+    fn try_from_rejects_a_whitespace_only_id_as_empty() {
+        assert_eq!(MessageId::try_from("   "), Err(InvalidId::Empty));
+        assert_eq!(ConsumerId::try_from("   "), Err(InvalidId::Empty));
+    }
+
+    #[test]
+    fn try_from_rejects_an_id_with_a_leading_space() {
+        assert_eq!(
+            MessageId::try_from(" m-1"),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+        assert_eq!(
+            ConsumerId::try_from(" billing"),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+    }
+
+    #[test]
+    fn try_from_rejects_an_id_with_a_trailing_space() {
+        assert_eq!(
+            MessageId::try_from("m-1 "),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+        assert_eq!(
+            ConsumerId::try_from("billing "),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+    }
+
+    #[test]
     fn ids_are_constructible_from_str_and_string() {
         assert_eq!(ConsumerId::try_from("billing").unwrap().as_str(), "billing");
         assert_eq!(
@@ -187,8 +278,74 @@ mod tests {
     }
 
     #[test]
-    fn outcome_skipped_yields_nothing() {
-        let outcome: Outcome<u8> = Outcome::Skipped;
+    fn outcome_duplicate_yields_nothing() {
+        let outcome: Outcome<u8> = Outcome::Duplicate;
         assert_eq!(outcome.processed(), None);
+    }
+
+    #[test]
+    fn scoped_rejects_both_parts_empty() {
+        assert_eq!(MessageId::scoped("", ""), Err(InvalidId::Empty));
+    }
+
+    #[test]
+    fn scoped_rejects_an_empty_scope() {
+        assert_eq!(MessageId::scoped("", "1"), Err(InvalidId::Empty));
+    }
+
+    #[test]
+    fn scoped_rejects_an_empty_id() {
+        assert_eq!(MessageId::scoped("producer-a", ""), Err(InvalidId::Empty));
+    }
+
+    #[test]
+    fn scoped_rejects_a_colon_in_the_scope() {
+        // Without this, scoped("a:b", "c") and scoped("a", "b:c") would both
+        // join to "a:b:c" and collide.
+        assert_eq!(
+            MessageId::scoped("a:b", "c"),
+            Err(InvalidId::ScopeContainsSeparator)
+        );
+    }
+
+    #[test]
+    fn scoped_allows_a_colon_in_the_id() {
+        // Kafka users commonly compose `topic:partition:offset` as their raw
+        // id, and that must pass through unscathed.
+        let id = MessageId::scoped("producer-a", "topic:partition:offset").unwrap();
+        assert_eq!(id.as_str(), "producer-a:topic:partition:offset");
+    }
+
+    #[test]
+    fn scoped_enforces_the_combined_length_limit() {
+        let scope = "s";
+        let id = "x".repeat(MessageId::MAX_LEN); // + "s:" pushes it over MAX_LEN
+        assert!(MessageId::scoped(scope, &id).is_err());
+    }
+
+    #[test]
+    fn scoped_rejects_a_scope_with_surrounding_whitespace_instead_of_a_different_key() {
+        // Without this check, scoped(" mt5", "1") and scoped("mt5", "1")
+        // would silently produce two different keys for the same producer.
+        assert_eq!(
+            MessageId::scoped(" mt5", "1"),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+        assert_eq!(
+            MessageId::scoped("mt5 ", "1"),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+    }
+
+    #[test]
+    fn scoped_rejects_an_id_with_surrounding_whitespace() {
+        assert_eq!(
+            MessageId::scoped("mt5", " 1"),
+            Err(InvalidId::SurroundingWhitespace)
+        );
+        assert_eq!(
+            MessageId::scoped("mt5", "1 "),
+            Err(InvalidId::SurroundingWhitespace)
+        );
     }
 }
