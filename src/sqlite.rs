@@ -12,6 +12,17 @@ use crate::types::{Claim, ClaimRequest};
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
+/// The exact DDL `migrate()` applies on SQLite.
+///
+/// Sourced with `include_str!` from the same migration file `MIGRATOR` runs,
+/// so this constant and the applied schema cannot drift apart — there is only
+/// one copy of the SQL, just two ways to reach it. Teams that manage schema
+/// with Liquibase, Flyway, Atlas, or their own tooling can paste this
+/// directly into their own migration chain instead of standing up a second,
+/// competing one against a database `sqlx::migrate!` also touches.
+pub const MIGRATION_SQL: &str =
+    include_str!("../migrations/sqlite/20260916000001_create_inbox_messages.sql");
+
 const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
                          VALUES (?, ?, ?) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";

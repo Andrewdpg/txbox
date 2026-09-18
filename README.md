@@ -28,6 +28,10 @@ repeated on redelivery.
 Here is a consumer that looks correct — the kind of code a competent
 engineer would write and ship — without `txbox`:
 
+<!-- Both snippets in this section stay `rust,ignore`: they call into
+     `rdkafka`, which is only available under the `example-kafka` feature,
+     and the README doctests build with `postgres`/`sqlite`, not that one. -->
+
 ```rust,ignore
 loop {
     let message = consumer.recv().await?;
@@ -60,7 +64,7 @@ loop {
     let payload = message.payload().unwrap_or_default().to_vec();
 
     let outcome = inbox
-        .process(&consumer_id, &id, move |conn| {
+        .process(&id, move |conn| {
             Box::pin(async move {
                 sqlx::query("INSERT INTO orders (payload) VALUES ($1)")
                     .bind(&payload[..])
@@ -120,6 +124,35 @@ Two backend behaviors differ and are worth knowing:
   but a different tool writing that column in another format would
   break purging. Another reason to let `migrate()` own the schema.
 
+## The inbox must live in the same database as the effect
+
+The inbox row and the business effect are only one transaction if they
+are one connection to one database. If your business data is sharded
+across N databases, you need N `Consumer<S>` instances, each pointed at
+its own store, and a router in front of them that sends a message to the
+right one — a `Consumer<S>` holds exactly one `S`, and one store is
+exactly one database.
+
+Someone will eventually propose putting the inbox in a single, central
+database "to keep it all in one place" — a dashboard, a shared admin
+database, whatever is closest to hand. Doing that **silently destroys
+the guarantee**. The inbox `INSERT` and the business effect's `INSERT`
+now target two different databases, so they cannot share a transaction:
+sqlx has no cross-database transaction to hand them, and nothing about
+running them back to back makes them atomic. You are back to exactly the
+problem this crate exists to solve, except now it is hidden behind code
+that *looks* like it uses `txbox` correctly. Nothing throws, nothing
+logs an error — the tests still pass, because a test against one
+database never exercises the shard boundary — the duplicate just gets
+processed twice, silently, the first time load is split across shards
+for real.
+
+`txbox` does not provide the router, and that is deliberate: the
+sharding topology, the routing key, and the failure mode when a shard is
+unreachable are all decisions specific to your system, not something a
+generic inbox library can make for you. This crate gives you a store per
+database; wiring the right message to the right store is on you.
+
 ## Quickstart
 
 ```rust
@@ -167,6 +200,92 @@ every call, and its own tuning, so two queues sharing a pool can be
 configured independently. `migrate` and `purge` stay on the backend: they
 belong to the database, not to a queue.
 
+## Identifiers
+
+### Choosing a message id
+
+This is the highest-risk decision you make when integrating `txbox`, and
+it changes completely with the transport. `MessageId` is only as good as
+the value you feed it:
+
+| Broker | What to use | The trap |
+|---|---|---|
+| Kafka | the producer's key | The offset changes if the message is republished, and it is per partition — you would need `topic:partition:offset` |
+| AMQP / RabbitMQ | `message_id`, scoped by `app_id` | `message_id` is only unique within one producer |
+| SQS standard | an attribute set by the producer | **SQS's own `MessageId` changes on every `SendMessage`** — a producer retry generates a new one, so it cannot be the key |
+| SQS FIFO | `MessageDeduplicationId` | FIFO queues only, and its own dedup window is 5 minutes |
+| Pub/Sub | `messageId` | Stable for redeliveries of one publish, new if the producer retries |
+
+The pattern underneath every row: **the identifier must come from the
+producer and survive the producer's own retry.** A value the broker or
+the transport assigns on delivery — an offset, a receipt handle, its own
+per-attempt `MessageId` — is not stable across a retry and will make a
+genuine retry look like a brand-new message. This is also the argument
+for an outbox on the publishing side: it is what lets a producer retry
+safely without minting a new identifier each time. `txbox` does not
+provide that half — see [Scope](#scope).
+
+### `MessageId::scoped` and cross-producer collisions
+
+The AMQP row above is the one case in the table where the raw id is
+ambiguous by construction: `message_id` alone only disambiguates within
+one producer, so two producers can legitimately emit the same one.
+[`MessageId::scoped`] folds the producer's identity in to avoid the
+collision:
+
+```rust
+use txbox::MessageId;
+
+# fn build() -> Result<(), txbox::InvalidId> {
+let id = MessageId::scoped("orders-producer", "msg-123")?;
+assert_eq!(id.as_str(), "orders-producer:msg-123");
+# Ok(()) }
+```
+
+`scoped` takes the scope (here, the AMQP `app_id`) and the raw id,
+rejects a `':'` in the scope (it would make `scoped("a:b", "c")` and
+`scoped("a", "b:c")` collide), and rejects either part having leading or
+trailing whitespace rather than silently trimming it — see
+[`InvalidId::SurroundingWhitespace`] for why.
+
+### Consumer ids
+
+Two services consuming the same topic **must** use different
+`ConsumerId` values. The dedup key is `(consumer_id, message_id)`; if two
+services share a `ConsumerId`, whichever processes a message first will
+cause the second to silently skip it as a duplicate, even though it
+never ran its own handler.
+
+### Validation rules
+
+`ConsumerId` and `MessageId` are validated when they are built, not when
+the database is touched. Both reject an empty value and anything longer
+than their byte limit — 255 for `ConsumerId`, 512 for `MessageId` —
+returning [`InvalidId`].
+
+Both rules guard a real failure, and both failures are silent or
+permanent rather than merely inconvenient:
+
+- **Empty.** Every empty identifier equals every other one. A producer
+  emitting keyless messages would have all of them collapse onto a
+  single inbox row, and every message after the first would be skipped
+  as a duplicate of a message it has nothing to do with. Nothing logs an
+  error; the data is simply missing.
+- **Too long.** PostgreSQL rejects a btree index entry larger than about
+  2704 bytes, and the inbox's primary key spans both identifiers. Past
+  that, the `INSERT` in `claim` fails permanently. A caller following
+  this crate's own advice — treat `InboxError::Backend` as transient and
+  retry it — would retry forever and stall the partition on one
+  malformed message. SQLite has no such limit, so the failure would not
+  reproduce in local development.
+
+Validating at construction makes the distinction impossible to get
+wrong: `InvalidId` is a separate type from `InboxError`, so an
+unprocessable identifier cannot be mistaken for a retryable backend
+blip. A message whose id fails to build is a poison message — dead-letter
+it and commit past it, as `examples/kafka_consumer.rs` shows. Retrying it
+cannot help, because it will fail identically every time.
+
 ## Migrations
 
 `migrate()` runs `sqlx::migrate!` against the crate's bundled migrations.
@@ -189,6 +308,11 @@ CREATE INDEX IF NOT EXISTS idx_inbox_processed_at
     ON inbox_messages (processed_at);
 ```
 
+The same text is also exposed as `postgres::MIGRATION_SQL`, sourced
+with `include_str!` from this same file, so the constant and the
+migration can never diverge — copy it into whatever migration tool your
+team already runs.
+
 ### SQLite (`migrations/sqlite/20260916000001_create_inbox_messages.sql`)
 
 ```sql
@@ -202,6 +326,51 @@ CREATE TABLE IF NOT EXISTS inbox_messages (
 CREATE INDEX IF NOT EXISTS idx_inbox_processed_at
     ON inbox_messages (processed_at);
 ```
+
+The same text is also exposed as `sqlite::MIGRATION_SQL`, sourced with
+`include_str!` from this same file, for the same reason.
+
+### Multi-tenant schemas
+
+The table name `inbox_messages` is hardcoded in the SQL above — there is
+no feature or config option to rename it. If you run PostgreSQL with a
+per-tenant schema and need the inbox there instead of `public`, you do
+not need one: set `search_path` on the connection, and the unqualified
+table name in every query this crate runs resolves to whichever schema
+is first on that path.
+
+```rust
+use sqlx::postgres::PgConnectOptions;
+
+let options = PgConnectOptions::new().options([("search_path", "tenant_42")]);
+# let _ = options;
+```
+
+Pass `options` to `PgPoolOptions::connect_with`, or, if the pool is built
+from a URL and you cannot change that, set it per-connection instead with
+`PgPoolOptions::after_connect`:
+
+```rust
+use sqlx::postgres::PgPoolOptions;
+use sqlx::Executor;
+
+# async fn build() -> Result<(), Box<dyn std::error::Error>> {
+let pool = PgPoolOptions::new()
+    .after_connect(|conn, _meta| {
+        Box::pin(async move {
+            conn.execute("SET search_path = 'tenant_42'").await?;
+            Ok(())
+        })
+    })
+    .connect("postgres://localhost/mydb")
+    .await?;
+# let _ = pool;
+# Ok(()) }
+```
+
+Either way, `PgInbox` never sees the schema at all — it only ever writes
+`inbox_messages`, unqualified, and the connection decides what that
+resolves to.
 
 ## Batching
 
@@ -439,6 +608,75 @@ async fn run_purge_loop(inbox: impl InboxStore) {
 If you run more than one instance of your service, do not spawn this
 loop from inside it — run it as a separate, singleton job instead.
 
+## Observability
+
+`process` and `claim` are wrapped in an `inbox.claim` span (nested inside
+`inbox.process`, on the backends where the two are distinct). If your
+subscriber uses `tracing-opentelemetry`, that span is exported as a
+histogram of claim latency without any separate metrics hook: the span's
+duration *is* the metric. Watching claim latency degrade under load, or
+comparing it across backends, is a matter of reading that histogram,
+not adding instrumentation.
+
+Every duplicate skip is logged under its own tracing target,
+`txbox::duplicate`, rather than the crate's default target. Setting
+`RUST_LOG=txbox::duplicate=debug` watches duplicate volume — a useful
+signal for redelivery storms and rebalance events — without turning on
+debug logging for the rest of the crate.
+
+## Recording what a handler decided
+
+The inbox row deliberately stores only `(consumer_id, message_id,
+processed_at)` — enough to answer "have we seen this?", nothing about
+what the handler did when it ran. Sooner or later someone asks "this
+message arrived three times, what did the first attempt actually do?",
+and the inbox itself has no answer.
+
+The recipe is to let the handler answer that question itself, in its own
+table, inside the same transaction `process` already gives it:
+
+```rust
+use txbox::postgres::PgInbox;
+use txbox::{ConsumerId, InboxExt, MessageId};
+
+async fn run(inbox: &PgInbox, id: &MessageId) -> Result<(), Box<dyn std::error::Error>> {
+let orders = inbox.consumer(ConsumerId::try_from("orders")?);
+let id_for_log = id.as_str().to_owned();
+
+orders
+    .process(id, move |conn| {
+        Box::pin(async move {
+            sqlx::query("INSERT INTO orders (payload) VALUES ($1)")
+                .bind("...")
+                .execute(&mut *conn)
+                .await?;
+
+            // The handler's own audit row, same transaction, own schema and
+            // own versioning — commits and rolls back with everything above.
+            sqlx::query(
+                "INSERT INTO order_processing_log (message_id, decision) \
+                 VALUES ($1, $2)",
+            )
+            .bind(id_for_log)
+            .bind("applied")
+            .execute(&mut *conn)
+            .await?;
+
+            Ok::<_, txbox::HandlerError>(())
+        })
+    })
+    .await?;
+Ok(()) }
+```
+
+`txbox` does not store this for you, on purpose. Recording "what did the
+handler decide" means picking a shape for that decision, and the caller
+already knows that shape — an enum, a result payload, a version number —
+better than a generic library could guess it. Storing it here would mean
+this crate inventing a serialization format and a versioning story for
+data it has no business owning, on top of every table your handler
+already writes to.
+
 ## Scope
 
 This crate deliberately does not do the following.
@@ -458,6 +696,15 @@ This crate deliberately does not do the following.
 - **No broker integration.** `txbox` never talks to Kafka, SQS, or
   anything else. It receives a `MessageId` you extracted yourself and
   has no opinion about where it came from.
+- **Not needed when the effect already carries its own idempotency
+  check.** If the business effect is an append to an event store with
+  optimistic concurrency — `expected_version`, or an equivalent
+  version-checked write — the append itself already rejects a
+  redelivery: a retried append arrives with a stale expected version and
+  fails, which *is* the idempotency check. Adding `txbox` on top would be
+  a second dedup mechanism guarding a write that already refuses to be
+  duplicated. Knowing when this crate is unnecessary is as much a part of
+  using it well as knowing when it applies.
 
 ## Don't copy this into production
 
@@ -483,44 +730,6 @@ production use. Specifically:
   replace them with your own.
 - The purge loop in the example runs in-process for readability. As
   described above, run it as a scheduled job instead.
-
-## Identifiers
-
-`ConsumerId` and `MessageId` are validated when they are built, not when
-the database is touched. Both reject an empty value and anything longer
-than their byte limit — 255 for `ConsumerId`, 512 for `MessageId` —
-returning [`InvalidId`].
-
-Both rules guard a real failure, and both failures are silent or
-permanent rather than merely inconvenient:
-
-- **Empty.** Every empty identifier equals every other one. A producer
-  emitting keyless messages would have all of them collapse onto a
-  single inbox row, and every message after the first would be skipped
-  as a duplicate of a message it has nothing to do with. Nothing logs an
-  error; the data is simply missing.
-- **Too long.** PostgreSQL rejects a btree index entry larger than about
-  2704 bytes, and the inbox's primary key spans both identifiers. Past
-  that, the `INSERT` in `claim` fails permanently. A caller following
-  this crate's own advice — treat `InboxError::Backend` as transient and
-  retry it — would retry forever and stall the partition on one
-  malformed message. SQLite has no such limit, so the failure would not
-  reproduce in local development.
-
-Validating at construction makes the distinction impossible to get
-wrong: `InvalidId` is a separate type from `InboxError`, so an
-unprocessable identifier cannot be mistaken for a retryable backend
-blip. A message whose id fails to build is a poison message — dead-letter
-it and commit past it, as `examples/kafka_consumer.rs` shows. Retrying it
-cannot help, because it will fail identically every time.
-
-## Consumer ids
-
-Two services consuming the same topic **must** use different
-`ConsumerId` values. The dedup key is `(consumer_id, message_id)`; if two
-services share a `ConsumerId`, whichever processes a message first will
-cause the second to silently skip it as a duplicate, even though it
-never ran its own handler.
 
 ## License
 

@@ -15,6 +15,17 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
+/// The exact DDL `migrate()` applies on PostgreSQL.
+///
+/// Sourced with `include_str!` from the same migration file `MIGRATOR` runs,
+/// so this constant and the applied schema cannot drift apart — there is only
+/// one copy of the SQL, just two ways to reach it. Teams that manage schema
+/// with Liquibase, Flyway, Atlas, or their own tooling can paste this
+/// directly into their own migration chain instead of standing up a second,
+/// competing one against a database `sqlx::migrate!` also touches.
+pub const MIGRATION_SQL: &str =
+    include_str!("../migrations/postgres/20260916000001_create_inbox_messages.sql");
+
 // `now()` is the database's clock, and the database is the one clock every
 // replica already shares. Retention is a temporal invariant — `max_age` must
 // exceed the broker's redelivery window — so a timestamp taken from whichever
