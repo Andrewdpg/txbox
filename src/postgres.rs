@@ -15,33 +15,19 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
-/// The exact DDL `migrate()` applies on PostgreSQL.
-///
-/// Sourced with `include_str!` from the same migration file `MIGRATOR` runs,
-/// so this constant and the applied schema cannot drift apart — there is only
-/// one copy of the SQL, just two ways to reach it. Teams that manage schema
-/// with Liquibase, Flyway, Atlas, or their own tooling can paste this
-/// directly into their own migration chain instead of standing up a second,
-/// competing one against a database `sqlx::migrate!` also touches.
+/// The exact DDL `migrate()` applies on PostgreSQL. Sourced with
+/// `include_str!` from the same file `MIGRATOR` runs, so paste it into your
+/// own migration tooling if you'd rather not use `sqlx::migrate!`.
 pub const MIGRATION_SQL: &str =
     include_str!("../migrations/postgres/20260916000001_create_inbox_messages.sql");
 
-// `now()` is the database's clock, and the database is the one clock every
-// replica already shares. Retention is a temporal invariant — `max_age` must
-// exceed the broker's redelivery window — so a timestamp taken from whichever
-// replica happened to write the row is only as trustworthy as that replica's
-// clock. A slow one writes rows that look older than they are, and the purge
-// deletes them while the broker can still redeliver. Reading the clock here
-// removes the failure rather than asking operators to keep NTP healthy.
+// `now()` reads the database's clock rather than the caller's, since a slow
+// replica clock could otherwise write rows that look older than they are and
+// get purged while still within the broker's redelivery window.
 const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
                          VALUES ($1, $2, now()) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
 
-// `ctid` addresses the row directly, so the delete is a fetch by physical
-// location rather than a second lookup through the primary key. `ORDER BY
-// processed_at` costs nothing — the index on that column already supplies the
-// order — and makes each batch take the oldest rows, so repeated passes move
-// forward predictably instead of deleting an arbitrary subset each time.
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                          WHERE ctid IN ( \
                              SELECT ctid FROM inbox_messages \
@@ -49,13 +35,9 @@ const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                              ORDER BY processed_at LIMIT $2 \
                          )";
 
-// `set_config` with `is_local = true` is the parameterisable equivalent of
-// `SET LOCAL lock_timeout = ...`: `SET` itself does not accept a bind
-// parameter over the wire protocol `sqlx` uses, but `set_config` is an
-// ordinary function call and does. `is_local = true` is what makes this
-// transaction-scoped rather than session-scoped: the setting reverts when
-// this transaction ends (commit or rollback), so it can never leak onto the
-// next caller of a connection returned to the pool.
+// `set_config(..., true)` is the parameterisable equivalent of `SET LOCAL
+// lock_timeout`; `is_local = true` scopes it to this transaction so it can't
+// leak onto the next caller of a pooled connection.
 const SET_LOCK_TIMEOUT_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
 
 const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
@@ -123,10 +105,7 @@ impl InboxStore for PgInbox {
         Box::pin(
             async move {
                 if let Some(timeout) = lock_timeout {
-                    // Scoped to this transaction via `is_local = true` — see
-                    // the comment on `SET_LOCK_TIMEOUT_SQL`. Must run before
-                    // the claim INSERT below, which is the statement it is
-                    // meant to bound.
+                    // Must run before the claim INSERT, which it bounds.
                     sqlx::query(SET_LOCK_TIMEOUT_SQL)
                         .bind(format!("{}ms", timeout.as_millis()))
                         .execute(&mut *conn)
@@ -172,9 +151,6 @@ impl InboxStore for PgInbox {
         );
         Box::pin(
             async move {
-                // Deliberately on the pool rather than in a transaction: the
-                // point is to answer without opening one. A row read here is
-                // committed, which is what makes the `true` answer safe.
                 let known: bool = sqlx::query_scalar(KNOWN_DUPLICATE_SQL)
                     .bind(consumer.as_str())
                     .bind(id.as_str())

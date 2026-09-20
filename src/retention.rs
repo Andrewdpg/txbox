@@ -3,13 +3,8 @@ use std::time::Duration;
 /// How long processed messages are retained before being purged.
 ///
 /// `max_age` must exceed the broker's redelivery window (Kafka topic
-/// retention, SQS visibility timeout, and so on). An entry deleted while the
-/// broker can still redeliver its message will allow that message to be
-/// processed twice.
-///
-/// There is deliberately no row-count limit. The correctness rule is temporal;
-/// a size cap would, under a traffic spike, delete entries still inside the
-/// redelivery window — letting duplicates through at exactly peak load.
+/// retention, SQS visibility timeout, etc.) — purging a row the broker can
+/// still redeliver lets that message be processed twice.
 #[derive(Debug, Clone)]
 pub struct RetentionPolicy {
     max_age: Duration,

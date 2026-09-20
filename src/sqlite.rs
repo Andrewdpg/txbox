@@ -12,14 +12,8 @@ use crate::types::{Claim, ClaimRequest};
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
-/// The exact DDL `migrate()` applies on SQLite.
-///
-/// Sourced with `include_str!` from the same migration file `MIGRATOR` runs,
-/// so this constant and the applied schema cannot drift apart — there is only
-/// one copy of the SQL, just two ways to reach it. Teams that manage schema
-/// with Liquibase, Flyway, Atlas, or their own tooling can paste this
-/// directly into their own migration chain instead of standing up a second,
-/// competing one against a database `sqlx::migrate!` also touches.
+/// The exact DDL `migrate()` applies on SQLite. Sourced with `include_str!`
+/// from the same file `MIGRATOR` runs.
 pub const MIGRATION_SQL: &str =
     include_str!("../migrations/sqlite/20260916000001_create_inbox_messages.sql");
 
@@ -27,13 +21,8 @@ const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, pr
                          VALUES (?, ?, ?) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
 
-// Unlike the PostgreSQL backend, this one keeps taking the timestamp in the
-// caller's process. There is nowhere else to take it from: SQLite runs inside
-// that process, so its clock *is* the caller's clock and the skew between
-// replicas that motivates `now()` on PostgreSQL cannot arise here.
-//
-// `rowid` addresses the row directly, and `ORDER BY processed_at` takes the
-// oldest rows first so repeated batches move forward predictably.
+// SQLite runs in the caller's process, so its clock is the caller's clock —
+// the replica-skew concern that makes PostgreSQL use `now()` doesn't apply.
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                          WHERE rowid IN ( \
                              SELECT rowid FROM inbox_messages \
@@ -87,11 +76,7 @@ impl InboxStore for SqliteInbox {
         conn: &'a mut Self::Conn,
         request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>> {
-        // `request.lock_timeout` is a no-op here: SQLite has no
-        // per-transaction lock timeout. The equivalent is connection-level
-        // (`SqliteConnectOptions::busy_timeout`), which belongs to the pool
-        // the caller builds, not to a single consumer's configuration. See
-        // `Consumer::with_lock_timeout`.
+        // `request.lock_timeout` is a no-op here; see `Consumer::with_lock_timeout`.
         let ClaimRequest { consumer, id, .. } = request;
         let span = tracing::debug_span!(
             "inbox.claim",

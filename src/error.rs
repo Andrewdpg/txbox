@@ -2,29 +2,14 @@
 pub type HandlerError = Box<dyn std::error::Error + Send + Sync>;
 
 /// An identifier rejected at construction.
-///
-/// Validation happens when the newtype is built, not when the database is
-/// touched, so a bad identifier can never reach `claim`. That matters for
-/// classification: a backend failure is usually transient and worth retrying,
-/// whereas this is permanent. A caller that could not tell them apart would
-/// retry an unprocessable message forever and stall its partition.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum InvalidId {
-    /// The identifier was empty.
-    ///
-    /// Every empty identifier is equal to every other, so a producer emitting
-    /// keyless messages would see all but the first silently skipped as
-    /// duplicates of one another.
+    /// The identifier was empty (or whitespace-only).
     #[error("identifier is empty")]
     Empty,
 
     /// The identifier was longer than the backend can index.
-    ///
-    /// PostgreSQL rejects a btree entry larger than roughly 2704 bytes, and
-    /// the inbox's primary key covers both identifiers. The limits here are
-    /// well inside that budget and generous next to any real broker key: a
-    /// UUID is 36 bytes.
     #[error("identifier is {len} bytes, exceeding the {max}-byte limit")]
     TooLong {
         /// The length of the rejected identifier, in bytes.
@@ -33,61 +18,26 @@ pub enum InvalidId {
         max: usize,
     },
 
-    /// [`MessageId::scoped`](crate::MessageId::scoped) was given a `scope`
-    /// containing a `':'`.
-    ///
-    /// The separator is rejected in `scope` only, not in `id`: without this
-    /// rule, `scoped("a:b", "c")` and `scoped("a", "b:c")` would join to the
-    /// same string and collide. A scope is a short controlled identifier (a
-    /// producer, an app, a tenant) with no legitimate reason to contain a
-    /// colon, whereas a message id can — e.g. a Kafka `topic:partition:offset`
-    /// composite key.
+    /// [`MessageId::scoped`](crate::MessageId::scoped) rejects a `scope`
+    /// containing `':'`, since it's the join separator.
     #[error("scope contains the ':' separator")]
     ScopeContainsSeparator,
 
     /// The identifier had leading or trailing whitespace.
     ///
-    /// This is rejected rather than trimmed away. Trimming would silently
-    /// rewrite the key the caller passed in, and a library that quietly
-    /// changes your deduplication key is worse than one that refuses it:
-    /// `try_from("mt5 ")` and `try_from("mt5")` would then produce the same
-    /// `MessageId`, and the caller would never learn that the value it built
-    /// (say, by string-formatting a producer's raw output) carried stray
-    /// whitespace. Rejecting surfaces that bug at the producer, where it can
-    /// actually be fixed, instead of papering over it here. A whitespace-only
-    /// value is reported as [`Empty`](InvalidId::Empty) instead, since "this
-    /// id is blank" is the more useful message.
+    /// Rejected rather than trimmed, so a caller can't silently change its
+    /// dedup key by accident.
     #[error("identifier has leading or trailing whitespace")]
     SurroundingWhitespace,
 }
 
 /// Errors produced by the inbox.
-///
-/// The two variants are deliberately distinct because they demand different
-/// responses: a backend failure is usually transient and worth retrying,
-/// whereas a handler failure is business logic and the caller must decide
-/// between retrying and dead-lettering.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum InboxError {
-    /// The database rejected or failed to execute an operation.
-    ///
-    /// This wraps the backend's own error type, so callers who need to tell
-    /// a transient failure (worth retrying) from a permanent one (worth
-    /// dead-lettering) can downcast to it:
-    ///
-    /// ```no_run
-    /// # fn classify(err: &txbox::InboxError) {
-    /// use txbox::InboxError;
-    ///
-    /// if let InboxError::Backend(source) = err {
-    ///     if let Some(sqlx_err) = source.downcast_ref::<sqlx::Error>() {
-    ///         // e.g. sqlx::Error::PoolTimedOut is transient; retry it.
-    ///         // A constraint violation or bad credential usually is not.
-    ///     }
-    /// }
-    /// # }
-    /// ```
+    /// The database rejected or failed to execute an operation. Wraps the
+    /// backend's own error type; downcast to it (e.g. to `sqlx::Error`) to
+    /// tell a transient failure from a permanent one.
     #[error("inbox backend failure: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
 
@@ -97,27 +47,15 @@ pub enum InboxError {
     Handler(#[source] HandlerError),
 
     /// [`Consumer::claim`](crate::Consumer::claim) could not acquire the row
-    /// within the configured [`with_lock_timeout`](crate::Consumer::with_lock_timeout).
+    /// within [`with_lock_timeout`](crate::Consumer::with_lock_timeout).
     ///
-    /// This means another consumer is claiming this exact message right now,
-    /// not that the backend has failed. The correct response is to let the
-    /// broker redeliver the message — **never** to dead-letter it: the
-    /// message itself is not malformed or errored, it is simply contended at
-    /// this instant, and the contending consumer is expected to commit and
-    /// leave the row valid for a normal duplicate check on redelivery.
-    ///
-    /// On PostgreSQL this maps from SQLSTATE `55P03` (`lock_not_available`),
-    /// which the backend raises when `SET LOCAL lock_timeout` expires.
+    /// This means another consumer is claiming this message right now, not
+    /// that the backend has failed — retry it, don't dead-letter it.
     #[error("inbox claim contended: lock timeout exceeded")]
     Contended,
 
-    /// An identifier failed validation.
-    ///
-    /// Unlike [`Backend`](InboxError::Backend), which is usually transient
-    /// and worth retrying, this is permanent: the identifier is malformed and
-    /// will fail identically on every retry. Retrying it only redelivers the
-    /// same bad identifier forever, so a message that produces this belongs
-    /// in a dead-letter queue, not a retry loop.
+    /// An identifier failed validation. Permanent — retrying redelivers the
+    /// same bad identifier, so this belongs in a dead-letter queue.
     #[error("invalid identifier: {0}")]
     InvalidId(#[source] InvalidId),
 }

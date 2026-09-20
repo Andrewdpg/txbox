@@ -13,13 +13,8 @@ pub struct ConsumerId(String);
 /// Identifies a single message, as supplied by the broker or the producer.
 ///
 /// A raw sequence number is only unique *within the producer that emitted
-/// it*. When several producers publish to one queue and each numbers
-/// messages with its own local sequence, two of them can legitimately emit
-/// the same raw id — and the second is discarded as a duplicate it never
-/// actually was. This mirrors the risk documented on [`ConsumerId`]: sharing
-/// one dedup key across independent sources loses information silently
-/// rather than failing loudly. Use [`MessageId::scoped`] to fold the
-/// producer's identity into the key and avoid the collision.
+/// it*; if several producers share one queue, use [`MessageId::scoped`] to
+/// fold the producer's identity into the key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MessageId(String);
 
@@ -40,9 +35,6 @@ macro_rules! string_newtype {
 
             fn try_from(value: String) -> Result<Self, InvalidId> {
                 if value.trim().is_empty() {
-                    // Catches both "" and whitespace-only values: either way
-                    // the id is blank, and that is the more useful report
-                    // than SurroundingWhitespace.
                     return Err(InvalidId::Empty);
                 }
                 if value.trim().len() != value.len() {
@@ -80,33 +72,13 @@ string_newtype!(MessageId, 512);
 impl MessageId {
     /// Builds a message id scoped to `scope`, joining the two with `':'`.
     ///
-    /// Use this when several producers publish to one queue and each numbers
-    /// messages with its own local sequence: two producers can legitimately
-    /// emit the same raw id, and without a scope the second is silently
-    /// discarded as a duplicate of the first. See the type-level docs on
-    /// [`MessageId`] for the full risk.
+    /// `scope` and `id` are each checked individually for blankness and
+    /// surrounding whitespace before joining, so whitespace next to the
+    /// separator can't slip through unnoticed.
     ///
-    /// `scope` and `id` are each rejected if blank (empty or whitespace-only,
-    /// reported as [`InvalidId::Empty`]) or surrounded by whitespace
-    /// (reported as [`InvalidId::SurroundingWhitespace`]) — checked on each
-    /// part individually, not on the joined string, because whitespace
-    /// sitting right against the `':'` separator (e.g. a trailing space in
-    /// `scope`, or a leading one in `id`) would not be at either edge of the
-    /// joined value and would otherwise slip through silently. A scope like
-    /// `" mt5"` is rejected rather than joined into a different key than
-    /// `"mt5"` would have produced — see
-    /// [`InvalidId::SurroundingWhitespace`] for why this crate refuses
-    /// rather than trims. The joined value must also respect
-    /// [`MessageId::MAX_LEN`], enforced by [`MessageId::try_from`].
-    ///
-    /// The `':'` separator is rejected in `scope` but allowed in `id`. This
-    /// asymmetry is deliberate, not an oversight: without it,
-    /// `scoped("a:b", "c")` and `scoped("a", "b:c")` would both join to
-    /// `"a:b:c"` and collide. A scope is a short, controlled identifier — a
-    /// producer, an app, a tenant — that has no legitimate reason to contain
-    /// a colon. A message id can: Kafka users commonly compose
-    /// `topic:partition:offset` as their raw id, and that must pass through
-    /// unscathed.
+    /// `scope` rejects `':'`; `id` allows it (e.g. Kafka's
+    /// `topic:partition:offset`). Without that asymmetry,
+    /// `scoped("a:b", "c")` and `scoped("a", "b:c")` would collide.
     pub fn scoped(scope: &str, id: &str) -> Result<Self, InvalidId> {
         if scope.contains(':') {
             return Err(InvalidId::ScopeContainsSeparator);
@@ -137,20 +109,8 @@ pub enum Claim {
 /// [`Claim`].
 ///
 /// [`Consumer`](crate::consumer::Consumer) builds one internally on every call
-/// to `claim` or `process`; ordinary users of this crate never construct one.
-/// This type exists for third-party backend implementors, who read its fields
-/// to perform the claim.
-///
-/// It bundles the claim's identity — `consumer` and `id`, both required — with
-/// its policy — currently just `lock_timeout`, optional — behind one
-/// parameter instead of a growing list of positional arguments. `#[non_exhaustive]`
-/// so a future policy field (a new backend hint, say) can be added without
-/// breaking every implementor's call site.
-///
-/// Fields are public rather than hidden behind accessors: `#[non_exhaustive]`
-/// blocks external struct-literal construction and exhaustive destructuring,
-/// but field reads are unaffected, so a plain struct is simplest for
-/// implementors who only ever read it.
+/// to `claim` or `process`; this type exists for third-party backend
+/// implementors, who read its fields to perform the claim.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct ClaimRequest<'a> {
@@ -216,19 +176,12 @@ mod tests {
 
     #[test]
     fn a_message_id_beyond_the_length_limit_is_rejected() {
-        // PostgreSQL refuses a btree entry larger than ~2704 bytes. Without
-        // this check the INSERT in `claim` fails permanently, is reported as a
-        // backend error (which callers are told to retry), and stalls the
-        // partition forever on one malformed message.
         let too_long = "x".repeat(MessageId::MAX_LEN + 1);
         assert!(MessageId::try_from(too_long).is_err());
     }
 
     #[test]
     fn an_empty_message_id_is_rejected() {
-        // A producer that sends messages without a key would otherwise collapse
-        // every one of them onto the same id, and all but the first would be
-        // silently skipped as duplicates.
         assert!(MessageId::try_from("").is_err());
     }
 
@@ -300,8 +253,6 @@ mod tests {
 
     #[test]
     fn scoped_rejects_a_colon_in_the_scope() {
-        // Without this, scoped("a:b", "c") and scoped("a", "b:c") would both
-        // join to "a:b:c" and collide.
         assert_eq!(
             MessageId::scoped("a:b", "c"),
             Err(InvalidId::ScopeContainsSeparator)
@@ -310,8 +261,6 @@ mod tests {
 
     #[test]
     fn scoped_allows_a_colon_in_the_id() {
-        // Kafka users commonly compose `topic:partition:offset` as their raw
-        // id, and that must pass through unscathed.
         let id = MessageId::scoped("producer-a", "topic:partition:offset").unwrap();
         assert_eq!(id.as_str(), "producer-a:topic:partition:offset");
     }
@@ -325,8 +274,6 @@ mod tests {
 
     #[test]
     fn scoped_rejects_a_scope_with_surrounding_whitespace_instead_of_a_different_key() {
-        // Without this check, scoped(" mt5", "1") and scoped("mt5", "1")
-        // would silently produce two different keys for the same producer.
         assert_eq!(
             MessageId::scoped(" mt5", "1"),
             Err(InvalidId::SurroundingWhitespace)

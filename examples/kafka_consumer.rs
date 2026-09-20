@@ -23,29 +23,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let inbox = PgInbox::new(pool);
     inbox.migrate().await?;
 
-    // One handle per queue, built once. The identifier is settled here instead
-    // of being passed on every message, and tuning lives here too — so another
-    // queue sharing this pool is unaffected by how this one is configured.
-    //
-    // Two services consuming the same topic MUST use different identifiers, or
-    // the second will skip every message the first has already handled.
+    // Two services consuming the same topic MUST use different identifiers.
     let orders = inbox.consumer(ConsumerId::try_from("orders-billing")?);
 
     let kafka: StreamConsumer = ClientConfig::new()
         .set("bootstrap.servers", "localhost:9092")
         .set("group.id", "orders-billing")
-        // Offsets are committed by hand, only after the inbox transaction has
-        // committed. With auto-commit the offset would be committed on a timer,
-        // decoupled from processing: a crash between delivery and the database
-        // commit would advance the offset anyway and the message would never be
-        // redelivered. That turns at-least-once into at-most-once and removes
-        // the very guarantee this crate exists to provide.
+        // Manual commit: with auto-commit, a crash after delivery but before
+        // the inbox transaction commits would still advance the offset and
+        // lose the message.
         .set("enable.auto.commit", "false")
         .create()?;
     kafka.subscribe(&["orders.created"])?;
 
-    // Purging runs on one instance only. With N replicas, N in-process loops
-    // would compete to delete the same rows; prefer a scheduled job instead.
+    // Purging on one instance only; with N replicas prefer a scheduled job.
     let purge_inbox = inbox.clone();
     tokio::spawn(async move {
         // max_age must exceed the Kafka topic's retention window.
@@ -60,23 +51,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // A production consumer needs per-message error isolation (skip, retry
-    // with backoff, or dead-letter); a malformed record or a transient
-    // database blip should not take down the whole process. This example
-    // propagates every error with `?` and exits instead, only to stay
-    // readable — do not copy that part into production code.
+    // This example propagates errors with `?` and exits for readability; a
+    // production consumer needs per-message error isolation instead.
     loop {
         let message = kafka.recv().await?;
 
-        // The only broker-specific line in the whole program: pick a stable
-        // identifier. A producer-supplied key is better than the offset,
-        // which changes if the message is republished.
+        // A producer-supplied key is better than the offset, which changes
+        // if the message is republished.
         let key = message.key_view::<str>().transpose()?;
 
-        // A missing or malformed key is a poison message: it fails the same way
-        // on every redelivery, so retrying it would stall the partition
-        // forever. Commit past it instead. A real consumer dead-letters it
-        // first, rather than dropping it as this example does.
+        // A missing/malformed key fails the same way on every redelivery and
+        // would stall the partition forever; skip it instead (a real
+        // consumer would dead-letter it first).
         let id = match key.map(MessageId::try_from) {
             Some(Ok(id)) => id,
             rejected => {
@@ -105,10 +91,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Outcome::Duplicate => tracing::debug!(%id, "duplicate ignored"),
         }
 
-        // Commit only after the transaction committed. Crashing between these two
-        // points is safe and expected: the broker redelivers, and the inbox
-        // recognises the message as a duplicate. That window is precisely what the
-        // inbox pattern exists to make harmless.
+        // Commit only after the transaction committed; a crash in between is
+        // safe, since redelivery will hit the inbox as a duplicate.
         kafka.commit_message(&message, CommitMode::Async)?;
     }
 }
