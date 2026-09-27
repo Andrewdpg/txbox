@@ -15,7 +15,7 @@ categories = ["database", "asynchronous"]
 exclude = ["docs/"]
 
 [dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+sqlx = { version = "0.9", optional = true, default-features = false }
 thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -27,9 +27,13 @@ testcontainers-modules = { version = "0.15", features = ["postgres"] }
 tracing-subscriber = "0.3"
 
 [features]
-default = []
-postgres = ["sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
-sqlite = ["sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+default = ["runtime-tokio"]
+# Forwards to sqlx only when a backend already pulled sqlx in (the `?`), so
+# it costs nothing for a crate that only implements `InboxStore`. Turn it off
+# with `default-features = false` and enable another sqlx runtime yourself.
+runtime-tokio = ["sqlx?/runtime-tokio"]
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
 example-kafka = ["dep:rdkafka", "postgres"]
 
 [[example]]

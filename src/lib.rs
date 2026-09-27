@@ -13,6 +13,8 @@
 /// The `sqlx` version this crate was built against. Re-exported so handlers
 /// writing their own SQL can reach it as `txbox::sqlx` without declaring the
 /// dependency twice.
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
+#[cfg_attr(docsrs, doc(cfg(any(feature = "postgres", feature = "sqlite"))))]
 pub use sqlx;
 
 mod consumer;

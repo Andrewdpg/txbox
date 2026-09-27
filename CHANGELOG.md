@@ -12,6 +12,11 @@ This project is pre-1.0: breaking changes may land in any minor release.
 
 ### Changed
 
+- `sqlx` is now optional and only pulled in by a backend feature. The tokio
+  runtime moved to a `runtime-tokio` feature, on by default. If you set
+  `default-features = false`, add `features = ["runtime-tokio", ...]` or
+  enable another sqlx runtime, or sqlx panics at first use.
+
 ### Removed
 
 ### Fixed

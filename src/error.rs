@@ -60,6 +60,7 @@ pub enum InboxError {
     InvalidId(#[source] InvalidId),
 }
 
+#[cfg(any(feature = "postgres", feature = "sqlite"))]
 impl From<sqlx::Error> for InboxError {
     fn from(value: sqlx::Error) -> Self {
         InboxError::Backend(Box::new(value))

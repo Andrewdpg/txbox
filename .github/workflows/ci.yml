@@ -30,6 +30,16 @@ jobs:
 
       - run: cargo clippy --all-targets --features postgres,sqlite -- -D warnings
 
+      # sqlx is optional. A crate that only implements `InboxStore` selects no
+      # backend and must not compile sqlx at all.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: "! cargo tree -e normal --no-default-features | grep -q 'sqlx v'"
+
+      # Opting out of the default runtime must actually drop tokio, and txbox
+      # itself must not assume it.
+      - run: cargo check --no-default-features --features sqlite,sqlx/runtime-smol
+      - run: "! cargo tree -e normal --no-default-features --features sqlite,sqlx/runtime-smol | grep -q 'tokio v'"
+
       # The example lives behind its own feature, so neither the test run nor
       # the lint above ever builds it. It is code people copy; it should not be
       # the one file free to stop compiling.

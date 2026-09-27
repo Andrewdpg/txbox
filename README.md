@@ -70,6 +70,14 @@ Import both: `InboxStore` for `migrate`/`purge`, `InboxExt` for
 Neither is enabled by default. `sqlx` is re-exported as `txbox::sqlx`, so
 handlers writing their own SQL stay on the same version.
 
+sqlx runs on tokio through the default `runtime-tokio` feature. For another
+runtime, turn defaults off and pick it on sqlx:
+
+```toml
+txbox = { version = "0.2", default-features = false, features = ["sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-smol"] }
+```
+
 ## Read before you rely on this
 
 - **The inbox must live in the same database as the effect.** A shared
