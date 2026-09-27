@@ -28,7 +28,7 @@ jobs:
       # dependent sees before choosing one. It has to stand on its own.
       - run: cargo clippy --all-targets -- -D warnings
 
-      - run: cargo clippy --all-targets --features postgres,sqlite -- -D warnings
+      - run: cargo clippy --all-targets --features postgres,sqlite,testing -- -D warnings
 
       # sqlx is optional. A crate that only implements `InboxStore` selects no
       # backend and must not compile sqlx at all.
@@ -47,7 +47,7 @@ jobs:
 
       # The README is included as crate documentation, so a link that breaks in
       # it fails here rather than silently on docs.rs.
-      - run: cargo doc --no-deps --features postgres,sqlite
+      - run: cargo doc --no-deps --features postgres,sqlite,testing
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -67,4 +67,4 @@ jobs:
 
       # The PostgreSQL suites start their own database through testcontainers;
       # ubuntu-latest already runs a Docker daemon, so nothing to set up here.
-      - run: cargo test --features ${{ matrix.features }}
+      - run: cargo test --features ${{ matrix.features }},testing

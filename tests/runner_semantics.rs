@@ -40,6 +40,8 @@ impl DerefMut for FakeTx {
 struct FakeStore {
     seen: Arc<Mutex<HashSet<(String, String)>>>,
     committed: Arc<Mutex<Vec<String>>>,
+    rollbacks: Arc<Mutex<usize>>,
+    fail_rollback: bool,
 }
 
 impl InboxStore for FakeStore {
@@ -81,6 +83,18 @@ impl InboxStore for FakeStore {
             } else {
                 Claim::Duplicate
             })
+        })
+    }
+
+    fn rollback(&self, tx: FakeTx) -> BoxFuture<'_, Result<(), InboxError>> {
+        Box::pin(async move {
+            drop(tx);
+            *self.rollbacks.lock().unwrap() += 1;
+            if self.fail_rollback {
+                Err(InboxError::Backend("rollback failed".into()))
+            } else {
+                Ok(())
+            }
         })
     }
 
@@ -187,4 +201,39 @@ fn store_is_dyn_compatible_and_futures_are_send() {
     let erased: &dyn InboxStore<Conn = FakeConn, Tx = FakeTx> = &store;
     let policy = RetentionPolicy::new(Duration::from_secs(60));
     assert_send(&erased.purge(&policy));
+}
+
+#[tokio::test]
+async fn a_failing_handler_is_rolled_back_explicitly() {
+    let store = FakeStore::default();
+    let id = MessageId::try_from("m-1").unwrap();
+
+    let result = billing(&store)
+        .process::<_, ()>(&id, |_conn| Box::pin(async { Err("boom".into()) }))
+        .await;
+
+    assert!(matches!(result, Err(InboxError::Handler(_))));
+    assert_eq!(
+        *store.rollbacks.lock().unwrap(),
+        1,
+        "process must call InboxStore::rollback"
+    );
+}
+
+#[tokio::test]
+async fn a_failing_rollback_still_reports_the_handler_error() {
+    let store = FakeStore {
+        fail_rollback: true,
+        ..FakeStore::default()
+    };
+    let id = MessageId::try_from("m-1").unwrap();
+
+    let result = billing(&store)
+        .process::<_, ()>(&id, |_conn| Box::pin(async { Err("boom".into()) }))
+        .await;
+
+    match result {
+        Err(InboxError::Handler(e)) => assert_eq!(e.to_string(), "boom"),
+        other => panic!("expected the handler's error, got {other:?}"),
+    }
 }

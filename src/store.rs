@@ -18,8 +18,13 @@ pub trait InboxStore: Send + Sync {
     /// The backend's connection type, as handed to message handlers.
     type Conn: Send;
 
-    /// The backend's transaction type. Dropping it without committing must
-    /// roll back.
+    /// The backend's transaction type.
+    ///
+    /// Dropping it without committing must roll back, including when a
+    /// future holding it is cancelled: a pooled connection must never go
+    /// back to the pool with a transaction open, or the next caller's commit
+    /// commits it too. `txbox::testing::conformance` (the `testing`
+    /// feature) checks this.
     type Tx: DerefMut<Target = Self::Conn> + Send;
 
     /// Opens a new transaction.
@@ -28,12 +33,26 @@ pub trait InboxStore: Send + Sync {
     /// Commits a transaction.
     fn commit(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>>;
 
+    /// Rolls back a transaction.
+    ///
+    /// The default drops `tx`, relying on the rollback-on-drop contract
+    /// above. Override it when the driver can roll back explicitly, so the
+    /// common error path doesn't depend on `Drop`.
+    fn rollback(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        drop(tx);
+        Box::pin(async { Ok(()) })
+    }
+
     /// Records `id` for `consumer` on `conn`, reporting whether it was new.
     ///
     /// Must be a single atomic statement — a read followed by a conditional
     /// write is a race two concurrent consumers can both win. Must run on
     /// `conn`, the same connection the handler uses for its own effects, or
     /// the all-or-nothing guarantee is lost.
+    ///
+    /// Ids compare byte for byte: a case- or accent-insensitive collation, or
+    /// a column narrower than [`ConsumerId::MAX_LEN`] / [`MessageId::MAX_LEN`]
+    /// bytes, makes distinct messages collide and silently skips one.
     ///
     /// `request.lock_timeout`, when set, bounds how long this call waits for
     /// a row contended by another consumer before returning

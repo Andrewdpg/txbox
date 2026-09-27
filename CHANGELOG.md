@@ -11,6 +11,11 @@ This project is pre-1.0: breaking changes may land in any minor release.
 ### Added
 
 - `LockTimeout` marker trait for backends that enforce a claim lock timeout.
+- `InboxStore::rollback` (default: drop the transaction) and
+  `Consumer::rollback`. `process` now rolls back explicitly when the
+  handler fails.
+- `testing` feature with `txbox::testing::conformance`, a suite backend
+  authors run against their own `InboxStore`.
 
 ### Changed
 

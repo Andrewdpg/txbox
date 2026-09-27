@@ -88,6 +88,10 @@ impl InboxStore for SqliteInbox {
         Box::pin(async move { Ok(tx.commit().await?) })
     }
 
+    fn rollback(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        Box::pin(async move { Ok(tx.rollback().await?) })
+    }
+
     fn claim<'a>(
         &'a self,
         conn: &'a mut Self::Conn,

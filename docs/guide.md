@@ -76,8 +76,8 @@ the broker redelivers the whole batch. The transaction is also held open for
 the whole batch, so a concurrent consumer racing for any id in it blocks for
 that entire span. Commit the broker's offsets only after `commit` returns.
 
-To abandon a batch, drop the transaction — `InboxStore` has no explicit
-rollback, so generic code relies on the drop.
+To abandon a batch, call `orders.rollback(tx)`. Dropping the transaction
+also rolls it back, but the explicit call waits for it.
 
 ## Multi-tenant schemas
 
@@ -156,3 +156,36 @@ Ok(()) }
 `txbox` doesn't store this for you — the shape of that decision (an enum, a
 result payload, a version number) is yours to pick, and a generic library
 shouldn't guess it.
+
+## Writing a backend
+
+Implement `InboxStore` and run the conformance suite from your tests with
+the `testing` feature:
+
+```rust,ignore
+#[tokio::test]
+async fn my_backend_conforms() {
+    // A pool of exactly one connection, so a transaction leaked back to the
+    // pool is caught.
+    txbox::testing::conformance(MyInbox::new(one_connection_pool().await)).await;
+}
+```
+
+It checks that duplicates are detected, that a failed handler and a
+dropped transaction roll back, and that ids of maximum length that differ
+only in their last byte, in case or in accents stay distinct. The last two
+catch the usual schema mistakes: a narrow column, or a default collation
+that ignores case (MySQL's `utf8mb4_0900_ai_ci`, SQL Server's
+`SQL_Latin1_General_CP1_CI_AS`).
+
+If your driver's transaction borrows its connection (tokio-postgres's
+`Transaction<'_>`), own the pooled connection instead, issue `BEGIN` and
+`COMMIT` yourself, and roll back in `Drop` by moving the connection into a
+spawned task. Returning it to the pool with the transaction open lets the
+next caller commit it.
+
+## Writing a handler
+
+Pass the handler inline or as a `fn`. A closure stored in a `let` first
+loses the higher-ranked lifetime `process` needs, and the error ("one type
+is more general than the other") doesn't say why.

@@ -27,6 +27,9 @@ mod retention;
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub mod sqlite;
 mod store;
+#[cfg(feature = "testing")]
+#[cfg_attr(docsrs, doc(cfg(feature = "testing")))]
+pub mod testing;
 mod types;
 
 pub use consumer::Consumer;

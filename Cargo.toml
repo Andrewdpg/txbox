@@ -34,6 +34,8 @@ default = ["runtime-tokio"]
 runtime-tokio = ["sqlx?/runtime-tokio"]
 postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
 sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+# Exposes `txbox::testing::conformance` for backend authors. No dependencies.
+testing = []
 example-kafka = ["dep:rdkafka", "postgres"]
 
 [[example]]
@@ -41,5 +43,5 @@ name = "kafka_consumer"
 required-features = ["example-kafka"]
 
 [package.metadata.docs.rs]
-features = ["postgres", "sqlite"]
+features = ["postgres", "sqlite", "testing"]
 rustdoc-args = ["--cfg", "docsrs"]

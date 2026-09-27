@@ -74,6 +74,12 @@ impl<S: InboxStore> Consumer<S> {
         self.store.commit(tx)
     }
 
+    /// Rolls back a transaction opened with [`begin`](Self::begin),
+    /// discarding every claim and effect in it.
+    pub fn rollback(&self, tx: S::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        self.store.rollback(tx)
+    }
+
     /// Records `id` for this consumer on `conn`, reporting whether it was new.
     /// Must run on the same connection as the effects it guards.
     pub fn claim<'a>(
@@ -124,16 +130,31 @@ impl<S: InboxStore> Consumer<S> {
                         );
                         Ok(Outcome::Duplicate)
                     }
-                    Claim::Fresh => {
-                        let value = handler(&mut tx).await.map_err(InboxError::Handler)?;
-                        self.store.commit(tx).await?;
-                        tracing::debug!(
-                            consumer = %self.id,
-                            message_id = %id,
-                            "message processed"
-                        );
-                        Ok(Outcome::Processed(value))
-                    }
+                    Claim::Fresh => match handler(&mut tx).await {
+                        Ok(value) => {
+                            self.store.commit(tx).await?;
+                            tracing::debug!(
+                                consumer = %self.id,
+                                message_id = %id,
+                                "message processed"
+                            );
+                            Ok(Outcome::Processed(value))
+                        }
+                        Err(e) => {
+                            // The handler's error is the one the caller can act
+                            // on; a failed rollback still leaves the transaction
+                            // to roll back on drop.
+                            if let Err(rollback) = self.store.rollback(tx).await {
+                                tracing::warn!(
+                                    consumer = %self.id,
+                                    message_id = %id,
+                                    error = %rollback,
+                                    "rollback after a handler failure failed"
+                                );
+                            }
+                            Err(InboxError::Handler(e))
+                        }
+                    },
                 }
             }
             .instrument(span),
