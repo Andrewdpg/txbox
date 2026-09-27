@@ -58,18 +58,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // A producer-supplied key is better than the offset, which changes
         // if the message is republished.
-        let key = message.key_view::<str>().transpose()?;
-
-        // A missing/malformed key fails the same way on every redelivery and
-        // would stall the partition forever; skip it instead (a real
-        // consumer would dead-letter it first).
-        let id = match key.map(MessageId::try_from) {
-            Some(Ok(id)) => id,
-            rejected => {
-                tracing::error!(?rejected, "unprocessable message id, skipping");
-                kafka.commit_message(&message, CommitMode::Async)?;
-                continue;
-            }
+        // A missing, non-UTF-8 or invalid key fails the same way on every
+        // redelivery and would stall the partition forever; skip it instead
+        // (a real consumer would dead-letter it first).
+        let id = match message.key_view::<str>() {
+            Some(Ok(key)) => MessageId::try_from(key).ok(),
+            _ => None,
+        };
+        let Some(id) = id else {
+            tracing::error!(
+                offset = message.offset(),
+                "unprocessable message key, skipping"
+            );
+            kafka.commit_message(&message, CommitMode::Async)?;
+            continue;
         };
 
         let payload = message.payload().unwrap_or_default().to_vec();
