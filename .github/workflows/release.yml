@@ -1,0 +1,24 @@
+name: Release
+
+# Publishes to crates.io through trusted publishing: no token is stored in
+# the repository. crates.io must list this repository, this workflow file
+# and the `release` environment as a trusted publisher.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
