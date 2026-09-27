@@ -82,6 +82,9 @@ impl<S: Savepoints> Consumer<S> {
             tracing::debug_span!("inbox.process_many", consumer = %self.id, count = ids.len());
         Box::pin(
             async move {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
                 let mut tx = self.store.begin().await?;
                 let claims = self.claim_many(&mut tx, ids).await?;
                 let mut pending = claims.iter().filter(|c| **c == Claim::Fresh).count();
@@ -250,13 +253,9 @@ impl<S: InboxStore> Consumer<S> {
         Box::pin(
             async move {
                 let mut tx = self.store.begin().await?;
-                let request = ClaimRequest {
-                    lock_timeout: self.lock_timeout,
-                    ..ClaimRequest::new(&self.id, id)
-                };
-
-                match self.store.claim(&mut tx, request).await? {
+                match self.claim(&mut tx, id).await? {
                     Claim::Duplicate => {
+                        self.store.rollback(tx).await?;
                         // Separate target so duplicate volume can be watched
                         // (RUST_LOG=txbox::duplicate=debug) without enabling
                         // debug logging for the whole crate.

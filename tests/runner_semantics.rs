@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use txbox::{
     BoxFuture, Claim, ClaimBatch, ClaimRequest, Consumer, ConsumerId, InboxError, InboxExt,
-    InboxStore, MessageId, Outcome, RetentionPolicy,
+    InboxStore, MessageId, Outcome, RetentionPolicy, Savepoints,
 };
 
 /// A fake connection that records the business effects applied to it.
@@ -44,6 +44,7 @@ struct FakeStore {
     fail_rollback: bool,
     batches: Arc<Mutex<Vec<Vec<String>>>>,
     short_batches: bool,
+    begins: Arc<Mutex<usize>>,
 }
 
 impl InboxStore for FakeStore {
@@ -51,6 +52,7 @@ impl InboxStore for FakeStore {
     type Tx = FakeTx;
 
     fn begin(&self) -> BoxFuture<'_, Result<FakeTx, InboxError>> {
+        *self.begins.lock().unwrap() += 1;
         Box::pin(async {
             Ok(FakeTx {
                 conn: FakeConn::default(),
@@ -126,6 +128,33 @@ impl InboxStore for FakeStore {
 
     fn purge<'a>(&'a self, _policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>> {
         Box::pin(async { Ok(0) })
+    }
+}
+
+// Enough to reach `process_many`; these tests don't exercise savepoints.
+impl Savepoints for FakeStore {
+    fn savepoint<'a>(&'a self, _: &'a mut FakeConn) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn release_and_savepoint<'a>(
+        &'a self,
+        _: &'a mut FakeConn,
+    ) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn release<'a>(&'a self, _: &'a mut FakeConn) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn rollback_to<'a>(&'a self, _: &'a mut FakeConn) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn unclaim<'a>(
+        &'a self,
+        _: &'a mut FakeConn,
+        _: &'a ConsumerId,
+        _: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 
@@ -336,4 +365,32 @@ fn claim_batch_builds_a_lock_timeout_like_claim_request() {
     let batch = ClaimBatch::new(&consumer, &ids).with_lock_timeout(Duration::from_millis(200));
 
     assert_eq!(batch.lock_timeout, Some(Duration::from_millis(200)));
+}
+
+#[tokio::test]
+async fn a_duplicate_is_rolled_back_explicitly() {
+    let store = FakeStore::default();
+    let id = MessageId::try_from("m-1").unwrap();
+    fn noop(_: &mut FakeConn) -> BoxFuture<'_, Result<(), txbox::HandlerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    billing(&store).process(&id, noop).await.unwrap();
+    let outcome = billing(&store).process(&id, noop).await.unwrap();
+
+    assert_eq!(outcome, Outcome::Duplicate);
+    assert_eq!(*store.rollbacks.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn process_many_of_nothing_never_opens_a_transaction() {
+    let store = FakeStore::default();
+
+    let results = billing(&store)
+        .process_many::<_, ()>(&[], |_conn, _id| Box::pin(async { Ok(()) }))
+        .await
+        .unwrap();
+
+    assert!(results.is_empty());
+    assert_eq!(*store.begins.lock().unwrap(), 0);
 }
