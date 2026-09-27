@@ -56,7 +56,9 @@ let orders = db
 # Ok(()) }
 ```
 
-Unset by default (preserves blocking); no-op on SQLite.
+Unset by default (preserves blocking). Only backends that can enforce it
+implement `LockTimeout`; on SQLite the method doesn't exist, so bound the
+wait with `SqliteConnectOptions::busy_timeout` on the pool.
 
 ### What retention costs
 

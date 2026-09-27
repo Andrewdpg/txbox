@@ -32,5 +32,5 @@ mod types;
 pub use consumer::Consumer;
 pub use error::{HandlerError, InboxError, InvalidId};
 pub use retention::RetentionPolicy;
-pub use store::{BoxFuture, InboxExt, InboxStore};
+pub use store::{BoxFuture, InboxExt, InboxStore, LockTimeout};
 pub use types::{Claim, ClaimRequest, ConsumerId, MessageId, Outcome};

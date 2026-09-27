@@ -1,12 +1,14 @@
 //! PostgreSQL implementation of [`InboxStore`].
 
+use std::time::Duration;
+
 use sqlx::migrate::Migrator;
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 use tracing::Instrument;
 
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
-use crate::store::{BoxFuture, InboxStore};
+use crate::store::{BoxFuture, InboxStore, LockTimeout};
 use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId};
 
 /// PostgreSQL's SQLSTATE for `lock_not_available`, raised when
@@ -40,12 +42,34 @@ const PURGE_SQL: &str = "DELETE FROM inbox_messages \
 // leak onto the next caller of a pooled connection.
 const SET_LOCK_TIMEOUT_SQL: &str = "SELECT set_config('lock_timeout', $1, true)";
 
+/// PostgreSQL's `lock_timeout` value for `timeout`: whole milliseconds,
+/// rounded up, never below 1ms. `0` would disable the timeout instead of
+/// failing fast, so a zero or sub-millisecond `Duration` maps to `1ms`.
+fn pg_lock_timeout(timeout: Duration) -> String {
+    let ms = timeout.as_nanos().div_ceil(1_000_000).max(1);
+    format!("{ms}ms")
+}
+
 const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
                                        SELECT 1 FROM inbox_messages \
                                        WHERE consumer_id = $1 AND message_id = $2 \
                                    )";
 
 /// An inbox backed by PostgreSQL.
+///
+/// Honors lock timeouts ([`LockTimeout`]):
+///
+/// ```
+/// use std::time::Duration;
+/// use txbox::postgres::PgInbox;
+/// use txbox::{ConsumerId, InboxExt};
+///
+/// fn build(inbox: PgInbox) {
+///     let _ = inbox
+///         .consumer(ConsumerId::try_from("orders").unwrap())
+///         .with_lock_timeout(Duration::from_millis(200));
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PgInbox {
     pool: PgPool,
@@ -107,7 +131,7 @@ impl InboxStore for PgInbox {
                 if let Some(timeout) = lock_timeout {
                     // Must run before the claim INSERT, which it bounds.
                     sqlx::query(SET_LOCK_TIMEOUT_SQL)
-                        .bind(format!("{}ms", timeout.as_millis()))
+                        .bind(pg_lock_timeout(timeout))
                         .execute(&mut *conn)
                         .await?;
                 }
@@ -184,5 +208,22 @@ impl InboxStore for PgInbox {
             }
             Ok(total)
         })
+    }
+}
+
+impl LockTimeout for PgInbox {}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::pg_lock_timeout;
+
+    #[test]
+    fn lock_timeout_rounds_up_and_never_sends_zero() {
+        assert_eq!(pg_lock_timeout(Duration::ZERO), "1ms");
+        assert_eq!(pg_lock_timeout(Duration::from_micros(1)), "1ms");
+        assert_eq!(pg_lock_timeout(Duration::from_micros(1500)), "2ms");
+        assert_eq!(pg_lock_timeout(Duration::from_millis(200)), "200ms");
     }
 }

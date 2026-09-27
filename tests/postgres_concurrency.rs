@@ -269,3 +269,57 @@ async fn a_short_lock_timeout_returns_contended_quickly_instead_of_blocking() {
         "the retry must see a duplicate"
     );
 }
+
+/// PostgreSQL reads `lock_timeout = 0` as "no timeout". A zero (or
+/// sub-millisecond) `Duration` must still mean "don't wait", so the
+/// contended claim has to come back with `Contended` right away instead of
+/// blocking behind the winner's whole handler.
+#[tokio::test]
+async fn a_zero_lock_timeout_fails_fast_instead_of_disabling_the_timeout() {
+    const HANDLER: Duration = Duration::from_secs(5);
+    const CLAIM_HEADSTART: Duration = Duration::from_millis(250);
+
+    let (_container, _pool, inbox) = inbox().await;
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("contended-zero").unwrap();
+
+    let winner = tokio::spawn({
+        let inbox = Arc::clone(&inbox);
+        let consumer = consumer.clone();
+        let id = id.clone();
+        async move {
+            inbox
+                .consumer(consumer)
+                .process(&id, |_conn| {
+                    Box::pin(async move {
+                        tokio::time::sleep(HANDLER).await;
+                        Ok::<_, txbox::HandlerError>(())
+                    })
+                })
+                .await
+        }
+    });
+
+    tokio::time::sleep(CLAIM_HEADSTART).await;
+
+    let started = Instant::now();
+    let result = inbox
+        .consumer(consumer)
+        .with_lock_timeout(Duration::ZERO)
+        .process(&id, |_conn| Box::pin(async { Ok(()) }))
+        .await;
+    let waited = started.elapsed();
+
+    assert!(
+        matches!(result, Err(InboxError::Contended)),
+        "expected InboxError::Contended, got {result:?}"
+    );
+    assert!(
+        waited < HANDLER / 2,
+        "a zero timeout waited {waited:?}: it was sent as `0ms`, which disables the timeout"
+    );
+    winner
+        .await
+        .expect("task did not panic")
+        .expect("no inbox error");
+}

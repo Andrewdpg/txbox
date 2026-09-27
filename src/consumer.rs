@@ -3,7 +3,7 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::error::{HandlerError, InboxError};
-use crate::store::{BoxFuture, InboxStore};
+use crate::store::{BoxFuture, InboxStore, LockTimeout};
 use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId, Outcome};
 
 /// One logical consumer of one stream.
@@ -34,18 +34,16 @@ impl<S> Consumer<S> {
     pub fn store(&self) -> &S {
         &self.store
     }
+}
 
+impl<S: LockTimeout> Consumer<S> {
     /// Bounds how long [`claim`](Self::claim) (and therefore
     /// [`process`](Self::process)) will wait for a contended row before
-    /// giving up.
+    /// giving up with [`InboxError::Contended`].
     ///
     /// Unset by default: a consumer that loses the claim race blocks until
-    /// the winner's transaction resolves. On PostgreSQL, setting this issues
-    /// `SET LOCAL lock_timeout` before the claim, so losing the race returns
-    /// [`InboxError::Contended`] instead of blocking.
-    ///
-    /// No-op on SQLite — there's no per-transaction lock timeout there; use
-    /// `SqliteConnectOptions::busy_timeout` on the pool instead.
+    /// the winner's transaction resolves. Only available on backends that
+    /// implement [`LockTimeout`].
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = Some(timeout);
         self

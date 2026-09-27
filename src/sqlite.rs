@@ -31,6 +31,23 @@ const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                          )";
 
 /// An inbox backed by SQLite.
+///
+/// SQLite has no per-statement lock timeout, so this backend does not
+/// implement [`LockTimeout`](crate::LockTimeout) and `with_lock_timeout`
+/// does not exist on its consumers. Bound the wait on the pool instead,
+/// with `SqliteConnectOptions::busy_timeout`.
+///
+/// ```compile_fail
+/// use std::time::Duration;
+/// use txbox::sqlite::SqliteInbox;
+/// use txbox::{ConsumerId, InboxExt};
+///
+/// fn build(inbox: SqliteInbox) {
+///     let _ = inbox
+///         .consumer(ConsumerId::try_from("orders").unwrap())
+///         .with_lock_timeout(Duration::from_millis(200));
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct SqliteInbox {
     pool: SqlitePool,
@@ -76,7 +93,6 @@ impl InboxStore for SqliteInbox {
         conn: &'a mut Self::Conn,
         request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>> {
-        // `request.lock_timeout` is a no-op here; see `Consumer::with_lock_timeout`.
         let ClaimRequest { consumer, id, .. } = request;
         let span = tracing::debug_span!(
             "inbox.claim",

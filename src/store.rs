@@ -37,8 +37,9 @@ pub trait InboxStore: Send + Sync {
     ///
     /// `request.lock_timeout`, when set, bounds how long this call waits for
     /// a row contended by another consumer before returning
-    /// [`InboxError::Contended`] instead of blocking. Backends with no way to
-    /// bound the wait (SQLite) ignore it.
+    /// [`InboxError::Contended`] instead of blocking. Backends implementing
+    /// [`LockTimeout`] must honor it; others never receive `Some` from
+    /// [`Consumer`].
     fn claim<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
@@ -67,6 +68,16 @@ pub trait InboxStore: Send + Sync {
     /// Deletes entries older than the policy's window. Returns rows removed.
     fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>>;
 }
+
+/// A backend that honors [`ClaimRequest::lock_timeout`]: a claim waiting on
+/// a contended row gives up with [`InboxError::Contended`] once it expires.
+/// May round up to the backend's granularity, never down to zero.
+///
+/// Only consumers over a `LockTimeout` backend have
+/// [`with_lock_timeout`](crate::Consumer::with_lock_timeout), so asking for
+/// a timeout a backend can't enforce is a compile error rather than a
+/// silent no-op.
+pub trait LockTimeout: InboxStore {}
 
 /// Extension trait layered over [`InboxStore`]. Import it alongside
 /// [`InboxStore`] to get `.consumer(...)` on a store.
