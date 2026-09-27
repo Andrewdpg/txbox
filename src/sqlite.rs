@@ -42,6 +42,24 @@ const CLAIM_MANY_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_i
                               ON CONFLICT (consumer_id, message_id) DO NOTHING \
                               RETURNING message_id";
 
+const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
+                                       SELECT 1 FROM inbox_messages \
+                                       WHERE consumer_id = ? AND message_id = ? \
+                                   )";
+
+/// `SQLITE_BUSY` and `SQLITE_LOCKED` (primary codes, so extended codes match
+/// too): another connection holds the write lock. Contention, as on the
+/// other backends, not a backend failure.
+fn claim_error(e: sqlx::Error) -> InboxError {
+    if let sqlx::Error::Database(db) = &e
+        && let Some(code) = db.code().and_then(|c| c.parse::<i32>().ok())
+        && matches!(code & 0xff, 5 | 6)
+    {
+        return InboxError::Contended;
+    }
+    e.into()
+}
+
 // SQLite runs in the caller's process, so its clock is the caller's clock —
 // the replica-skew concern that makes PostgreSQL use `now()` doesn't apply.
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
@@ -132,7 +150,8 @@ impl InboxStore for SqliteInbox {
                     .bind(id.as_str())
                     .bind(Utc::now())
                     .execute(&mut *conn)
-                    .await?
+                    .await
+                    .map_err(claim_error)?
                     .rows_affected();
 
                 Ok(if affected == 1 {
@@ -164,7 +183,8 @@ impl InboxStore for SqliteInbox {
                     .bind(Utc::now())
                     .bind(Json(&ids))
                     .fetch_all(&mut *conn)
-                    .await?;
+                    .await
+                    .map_err(claim_error)?;
                 let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
                 Ok(ids
                     .iter()
@@ -181,23 +201,40 @@ impl InboxStore for SqliteInbox {
         )
     }
 
+    fn is_known_duplicate<'a>(
+        &'a self,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<bool, InboxError>> {
+        Box::pin(async move {
+            let known: bool = sqlx::query_scalar(KNOWN_DUPLICATE_SQL)
+                .bind(consumer.as_str())
+                .bind(id.as_str())
+                .fetch_one(&self.pool)
+                .await?;
+            Ok(known)
+        })
+    }
+
     fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>> {
         Box::pin(async move {
             let cutoff = Utc::now()
                 - chrono::Duration::from_std(policy.max_age())
                     .map_err(|e| InboxError::Backend(Box::new(e)))?;
 
+            let batch = policy.batch_size();
+
             let mut total = 0u64;
             loop {
                 let affected = sqlx::query(PURGE_SQL)
                     .bind(cutoff)
-                    .bind(i64::from(policy.batch_size()))
+                    .bind(batch)
                     .execute(&self.pool)
                     .await?
                     .rows_affected();
 
                 total += affected;
-                if affected < u64::from(policy.batch_size()) {
+                if affected < u64::from(batch) {
                     break;
                 }
             }

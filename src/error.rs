@@ -48,7 +48,8 @@ pub enum InboxError {
 
     /// A claim lost to another consumer holding the same row: the lock
     /// timeout ([`with_lock_timeout`](crate::Consumer::with_lock_timeout))
-    /// expired, or the database chose this transaction as a deadlock victim.
+    /// expired, the database chose this transaction as a deadlock victim, or
+    /// (SQLite) another connection held the write lock.
     ///
     /// Not a backend failure: retry the message, don't dead-letter it. Retry
     /// the whole unit in a new transaction, though. The current one is done:
