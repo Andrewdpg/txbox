@@ -1,6 +1,5 @@
 //! PostgreSQL implementation of [`InboxStore`].
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use sqlx::migrate::Migrator;
@@ -9,6 +8,7 @@ use tracing::Instrument;
 
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
+use crate::sql::{self, RELEASE_AND_SAVEPOINT_SQL, RELEASE_SQL, ROLLBACK_TO_SQL, SAVEPOINT_SQL};
 use crate::store::{BoxFuture, InboxStore, LockTimeout, Savepoints};
 use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
@@ -19,6 +19,20 @@ const LOCK_NOT_AVAILABLE: &str = "55P03";
 /// PostgreSQL's SQLSTATE for `deadlock_detected`, raised on the victim of a
 /// lock cycle.
 const DEADLOCK_DETECTED: &str = "40P01";
+
+/// Must run before the statement it bounds.
+async fn set_lock_timeout(
+    conn: &mut PgConnection,
+    timeout: Option<Duration>,
+) -> Result<(), sqlx::Error> {
+    if let Some(timeout) = timeout {
+        sqlx::query(SET_LOCK_TIMEOUT_SQL)
+            .bind(pg_lock_timeout(timeout))
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
+}
 
 /// Both codes mean another consumer holds the row: retryable contention,
 /// not a backend failure.
@@ -36,13 +50,6 @@ fn claim_error(e: sqlx::Error) -> InboxError {
     }
 }
 
-const SAVEPOINT_SQL: &str = "SAVEPOINT txbox_process_many";
-// Two statements in one round-trip; measured about 29% faster than
-// sending them separately.
-const RELEASE_AND_SAVEPOINT_SQL: &str =
-    "RELEASE SAVEPOINT txbox_process_many; SAVEPOINT txbox_process_many";
-const RELEASE_SQL: &str = "RELEASE SAVEPOINT txbox_process_many";
-const ROLLBACK_TO_SQL: &str = "ROLLBACK TO SAVEPOINT txbox_process_many";
 const UNCLAIM_SQL: &str = "DELETE FROM inbox_messages WHERE consumer_id = $1 AND message_id = $2";
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
@@ -171,21 +178,14 @@ impl InboxStore for PgInbox {
         );
         Box::pin(
             async move {
-                if let Some(timeout) = lock_timeout {
-                    // Must run before the claim INSERT, which it bounds.
-                    sqlx::query(SET_LOCK_TIMEOUT_SQL)
-                        .bind(pg_lock_timeout(timeout))
-                        .execute(&mut *conn)
-                        .await?;
-                }
-
-                let result = sqlx::query(CLAIM_SQL)
+                set_lock_timeout(&mut *conn, lock_timeout).await?;
+                let affected = sqlx::query(CLAIM_SQL)
                     .bind(consumer.as_str())
                     .bind(id.as_str())
                     .execute(&mut *conn)
-                    .await;
-
-                let affected = result.map_err(claim_error)?.rows_affected();
+                    .await
+                    .map_err(claim_error)?
+                    .rows_affected();
 
                 Ok(if affected == 1 {
                     Claim::Fresh
@@ -210,12 +210,7 @@ impl InboxStore for PgInbox {
         );
         Box::pin(
             async move {
-                if let Some(timeout) = batch.lock_timeout {
-                    sqlx::query(SET_LOCK_TIMEOUT_SQL)
-                        .bind(pg_lock_timeout(timeout))
-                        .execute(&mut *conn)
-                        .await?;
-                }
+                set_lock_timeout(&mut *conn, batch.lock_timeout).await?;
                 let ids: Vec<&str> = batch.ids.iter().map(|id| id.as_str()).collect();
                 let fresh: Vec<String> = sqlx::query_scalar(CLAIM_MANY_SQL)
                     .bind(batch.consumer.as_str())
@@ -223,17 +218,7 @@ impl InboxStore for PgInbox {
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(claim_error)?;
-                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
-                Ok(ids
-                    .iter()
-                    .map(|id| {
-                        if fresh.contains(id) {
-                            Claim::Fresh
-                        } else {
-                            Claim::Duplicate
-                        }
-                    })
-                    .collect())
+                Ok(sql::claims_from_fresh(&ids, &fresh))
             }
             .instrument(span),
         )
@@ -267,19 +252,19 @@ impl InboxStore for PgInbox {
     fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>> {
         Box::pin(async move {
             let max_age = policy.max_age().as_secs_f64();
-            let batch = i64::from(policy.batch_size());
+            let batch = policy.batch_size();
 
             let mut total = 0u64;
             loop {
                 let affected = sqlx::query(PURGE_SQL)
                     .bind(max_age)
-                    .bind(batch)
+                    .bind(i64::from(batch))
                     .execute(&self.pool)
                     .await?
                     .rows_affected();
 
                 total += affected;
-                if affected < u64::from(policy.batch_size()) {
+                if affected < u64::from(batch) {
                     break;
                 }
             }
@@ -292,35 +277,25 @@ impl LockTimeout for PgInbox {}
 
 impl Savepoints for PgInbox {
     fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(SAVEPOINT_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, SAVEPOINT_SQL)
     }
 
     fn release_and_savepoint<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(RELEASE_AND_SAVEPOINT_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, RELEASE_AND_SAVEPOINT_SQL)
     }
 
     fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(RELEASE_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, RELEASE_SQL)
     }
 
     fn rollback_to<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(ROLLBACK_TO_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, ROLLBACK_TO_SQL)
     }
 
     fn unclaim<'a>(

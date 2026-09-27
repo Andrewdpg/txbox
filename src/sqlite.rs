@@ -1,7 +1,5 @@
 //! SQLite implementation of [`InboxStore`].
 
-use std::collections::HashSet;
-
 use chrono::Utc;
 use sqlx::migrate::Migrator;
 use sqlx::types::Json;
@@ -10,16 +8,10 @@ use tracing::Instrument;
 
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
+use crate::sql::{self, RELEASE_AND_SAVEPOINT_SQL, RELEASE_SQL, ROLLBACK_TO_SQL, SAVEPOINT_SQL};
 use crate::store::{BoxFuture, InboxStore, Savepoints};
 use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
-const SAVEPOINT_SQL: &str = "SAVEPOINT txbox_process_many";
-// Two statements in one round-trip; measured about 29% faster than
-// sending them separately.
-const RELEASE_AND_SAVEPOINT_SQL: &str =
-    "RELEASE SAVEPOINT txbox_process_many; SAVEPOINT txbox_process_many";
-const RELEASE_SQL: &str = "RELEASE SAVEPOINT txbox_process_many";
-const ROLLBACK_TO_SQL: &str = "ROLLBACK TO SAVEPOINT txbox_process_many";
 const UNCLAIM_SQL: &str = "DELETE FROM inbox_messages WHERE consumer_id = ? AND message_id = ?";
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
@@ -185,17 +177,7 @@ impl InboxStore for SqliteInbox {
                     .fetch_all(&mut *conn)
                     .await
                     .map_err(claim_error)?;
-                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
-                Ok(ids
-                    .iter()
-                    .map(|id| {
-                        if fresh.contains(id) {
-                            Claim::Fresh
-                        } else {
-                            Claim::Duplicate
-                        }
-                    })
-                    .collect())
+                Ok(sql::claims_from_fresh(&ids, &fresh))
             }
             .instrument(span),
         )
@@ -245,35 +227,25 @@ impl InboxStore for SqliteInbox {
 
 impl Savepoints for SqliteInbox {
     fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(SAVEPOINT_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, SAVEPOINT_SQL)
     }
 
     fn release_and_savepoint<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(RELEASE_AND_SAVEPOINT_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, RELEASE_AND_SAVEPOINT_SQL)
     }
 
     fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(RELEASE_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, RELEASE_SQL)
     }
 
     fn rollback_to<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(ROLLBACK_TO_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, ROLLBACK_TO_SQL)
     }
 
     fn unclaim<'a>(

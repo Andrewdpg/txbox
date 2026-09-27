@@ -29,6 +29,8 @@ pub mod mysql;
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 pub mod postgres;
 mod retention;
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+mod sql;
 #[cfg(feature = "sqlite")]
 #[cfg_attr(docsrs, doc(cfg(feature = "sqlite")))]
 pub mod sqlite;

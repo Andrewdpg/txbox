@@ -5,7 +5,6 @@
 //! `utf8mb4_bin` pads with spaces (`'a' = 'a '`), both of which would merge
 //! distinct message ids.
 
-use std::collections::HashSet;
 use std::time::Duration;
 
 use sqlx::migrate::Migrator;
@@ -16,6 +15,7 @@ use tracing::Instrument;
 
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
+use crate::sql::{self, RELEASE_AND_SAVEPOINT_SQL, RELEASE_SQL, ROLLBACK_TO_SQL, SAVEPOINT_SQL};
 use crate::store::{BoxFuture, InboxStore, LockTimeout, Savepoints};
 use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
@@ -44,6 +44,8 @@ const BEGIN_SQL: &str = "SET SESSION innodb_lock_wait_timeout = \
                              CAST(COALESCE(@txbox_lock_wait_timeout, @@SESSION.innodb_lock_wait_timeout) AS UNSIGNED), \
                          @txbox_lock_wait_timeout = NULL; \
                          BEGIN";
+const SET_LOCK_TIMEOUT_SQL: &str = "SET @txbox_lock_wait_timeout = @@SESSION.innodb_lock_wait_timeout, \
+                                    SESSION innodb_lock_wait_timeout = ?";
 const RESTORE_LOCK_TIMEOUT_SQL: &str = "SET SESSION innodb_lock_wait_timeout = CAST(@txbox_lock_wait_timeout AS UNSIGNED), \
                                         @txbox_lock_wait_timeout = NULL";
 
@@ -70,12 +72,6 @@ const CLAIMED_BY_TOKEN_SQL: &str = "SELECT m.message_id \
      JOIN inbox_messages m ON m.consumer_id = ? AND m.message_id = j.id \
      WHERE m.claim_token = ?";
 
-const SAVEPOINT_SQL: &str = "SAVEPOINT txbox_process_many";
-// Two statements in one round-trip; the driver enables MULTI_STATEMENTS.
-const RELEASE_AND_SAVEPOINT_SQL: &str =
-    "RELEASE SAVEPOINT txbox_process_many; SAVEPOINT txbox_process_many";
-const RELEASE_SQL: &str = "RELEASE SAVEPOINT txbox_process_many";
-const ROLLBACK_TO_SQL: &str = "ROLLBACK TO SAVEPOINT txbox_process_many";
 const UNCLAIM_SQL: &str = "DELETE FROM inbox_messages WHERE consumer_id = ? AND message_id = ?";
 
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
@@ -99,14 +95,10 @@ async fn set_lock_timeout(
     timeout: Option<Duration>,
 ) -> Result<(), sqlx::Error> {
     if let Some(timeout) = timeout {
-        // An integer, so formatting it into the statement is safe.
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "SET @txbox_lock_wait_timeout = @@SESSION.innodb_lock_wait_timeout, \
-                 SESSION innodb_lock_wait_timeout = {}",
-            mysql_lock_timeout(timeout)
-        )))
-        .execute(conn)
-        .await?;
+        sqlx::query(SET_LOCK_TIMEOUT_SQL)
+            .bind(mysql_lock_timeout(timeout))
+            .execute(conn)
+            .await?;
     }
     Ok(())
 }
@@ -249,17 +241,7 @@ impl InboxStore for MySqlInbox {
                     .bind(token)
                     .fetch_all(&mut *conn)
                     .await?;
-                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
-                Ok(ids
-                    .iter()
-                    .map(|id| {
-                        if fresh.contains(id) {
-                            Claim::Fresh
-                        } else {
-                            Claim::Duplicate
-                        }
-                    })
-                    .collect())
+                Ok(sql::claims_from_fresh(&ids, &fresh))
             }
             .instrument(span),
         )
@@ -317,35 +299,25 @@ impl LockTimeout for MySqlInbox {}
 
 impl Savepoints for MySqlInbox {
     fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(SAVEPOINT_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, SAVEPOINT_SQL)
     }
 
     fn release_and_savepoint<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(RELEASE_AND_SAVEPOINT_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, RELEASE_AND_SAVEPOINT_SQL)
     }
 
     fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move { Ok(sqlx::raw_sql(RELEASE_SQL).execute(conn).await.map(drop)?) })
+        sql::execute(conn, RELEASE_SQL)
     }
 
     fn rollback_to<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
     ) -> BoxFuture<'a, Result<(), InboxError>> {
-        Box::pin(async move {
-            Ok(sqlx::raw_sql(ROLLBACK_TO_SQL)
-                .execute(conn)
-                .await
-                .map(drop)?)
-        })
+        sql::execute(conn, ROLLBACK_TO_SQL)
     }
 
     fn unclaim<'a>(
