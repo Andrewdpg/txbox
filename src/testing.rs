@@ -11,7 +11,7 @@ use std::time::SystemTime;
 
 use crate::{
     Claim, ClaimRequest, ConsumerId, HandlerError, InboxError, InboxExt, InboxStore, MessageId,
-    Outcome,
+    Outcome, Savepoints,
 };
 
 /// Runs every check against `store`, panicking on the first violated
@@ -263,6 +263,57 @@ async fn claim_many_matches_single_claims<S: InboxStore + Clone>(store: &S, run:
         assert!(
             is_committed(store, &consumer_id, &message(id)).await,
             "claim_many's fresh claims must commit"
+        );
+    }
+}
+
+/// Checks [`process_many`](crate::Consumer::process_many) against `store`:
+/// with poisons at the first, a middle and the last position, every other
+/// message and its effect commit, and each poison and its effect roll back
+/// and stay unclaimed. Panics on the first violation.
+pub async fn savepoints_conformance<S: Savepoints + Clone + 'static>(store: S) {
+    let run = Run::new();
+    let inbox = run.consumer("process-many");
+    let effects = run.consumer("process-many-effect");
+    let ids: Vec<MessageId> = (0..10).map(|i| message(&format!("m{i}"))).collect();
+    let poisons = ["m0", "m5", "m9"];
+
+    let (effect_store, effect_consumer) = (store.clone(), effects.clone());
+    let results = store
+        .consumer(inbox.clone())
+        .process_many(&ids, move |conn, id| {
+            let (effect_store, effect_consumer) = (effect_store.clone(), effect_consumer.clone());
+            let poisoned = poisons.contains(&id.as_str());
+            Box::pin(async move {
+                effect_store
+                    .claim(conn, ClaimRequest::new(&effect_consumer, id))
+                    .await?;
+                if poisoned {
+                    Err::<(), HandlerError>("poison".into())
+                } else {
+                    Ok(())
+                }
+            })
+        })
+        .await
+        .expect("process_many");
+
+    for (id, result) in ids.iter().zip(&results) {
+        let poisoned = poisons.contains(&id.as_str());
+        assert_eq!(
+            result.is_err(),
+            poisoned,
+            "result for {id} must be an error iff it is a poison"
+        );
+        assert_eq!(
+            is_committed(&store, &inbox, id).await,
+            !poisoned,
+            "{id}: claim must commit iff its handler succeeded"
+        );
+        assert_eq!(
+            is_committed(&store, &effects, id).await,
+            !poisoned,
+            "{id}: effect must commit iff its handler succeeded"
         );
     }
 }

@@ -32,8 +32,8 @@ mod store;
 pub mod testing;
 mod types;
 
-pub use consumer::Consumer;
+pub use consumer::{Consumer, ProcessResult};
 pub use error::{HandlerError, InboxError, InvalidId};
 pub use retention::RetentionPolicy;
-pub use store::{BoxFuture, InboxExt, InboxStore, LockTimeout};
+pub use store::{BoxFuture, InboxExt, InboxStore, LockTimeout, Savepoints};
 pub use types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId, Outcome};

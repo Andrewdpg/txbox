@@ -188,3 +188,46 @@ async fn postgres_passes_conformance() {
     inbox.migrate().await.expect("run migrations");
     conformance(inbox).await;
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_passes_savepoints_conformance() {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use txbox::sqlite::SqliteInbox;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let inbox = SqliteInbox::new(pool);
+    inbox.migrate().await.unwrap();
+    txbox::testing::savepoints_conformance(inbox).await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_passes_savepoints_conformance() {
+    use sqlx::postgres::PgPoolOptions;
+    use testcontainers_modules::postgres::Postgres as PostgresImage;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+    use txbox::postgres::PgInbox;
+
+    let container = PostgresImage::default()
+        .with_tag("15-alpine")
+        .start()
+        .await
+        .expect("start postgres");
+    let port = container.get_host_port_ipv4(5432).await.expect("map port");
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!(
+            "postgres://postgres:postgres@127.0.0.1:{port}/postgres"
+        ))
+        .await
+        .expect("connect to postgres");
+    let inbox = PgInbox::new(pool);
+    inbox.migrate().await.expect("run migrations");
+    txbox::testing::savepoints_conformance(inbox).await;
+}

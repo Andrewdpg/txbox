@@ -122,6 +122,40 @@ pub trait InboxStore: Send + Sync {
 /// silent no-op.
 pub trait LockTimeout: InboxStore {}
 
+/// A backend that supports savepoints, which is what lets
+/// [`process_many`](crate::Consumer::process_many) roll back one message's
+/// handler without losing the rest of the batch.
+///
+/// All methods act on one savepoint name owned by txbox. Only consumers over
+/// a `Savepoints` backend have `process_many`; elsewhere, loop over
+/// [`process`](crate::Consumer::process), which has the same semantics.
+pub trait Savepoints: InboxStore {
+    /// Opens the savepoint.
+    fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Releases the savepoint and opens it again, in one round-trip.
+    fn release_and_savepoint<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+    ) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Releases the savepoint.
+    fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Rolls back to the savepoint, which stays open.
+    fn rollback_to<'a>(&'a self, conn: &'a mut Self::Conn)
+    -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Deletes the claim of `id` for `consumer` on `conn`, so a message whose
+    /// handler failed stays unclaimed and is redelivered.
+    fn unclaim<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), InboxError>>;
+}
+
 /// Extension trait layered over [`InboxStore`]. Import it alongside
 /// [`InboxStore`] to get `.consumer(...)` on a store.
 pub trait InboxExt: InboxStore + Clone + Sized {

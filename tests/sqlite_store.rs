@@ -293,3 +293,31 @@ async fn claim_many_round_trips_awkward_ids() {
     want.sort();
     assert_eq!(stored, want, "ids must be stored byte for byte");
 }
+
+#[tokio::test]
+async fn process_many_runs_the_handler_once_per_distinct_id() {
+    let inbox = inbox().await;
+    let consumer = inbox.consumer(ConsumerId::try_from("many").unwrap());
+    let ids: Vec<MessageId> = ["a", "b", "a"]
+        .iter()
+        .map(|r| MessageId::try_from(*r).unwrap())
+        .collect();
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let results = consumer
+        .process_many(&ids, |_conn, id| {
+            let calls = Arc::clone(&calls);
+            let id = id.as_str().to_owned();
+            Box::pin(async move {
+                calls.lock().unwrap().push(id);
+                Ok(())
+            })
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(*calls.lock().unwrap(), ["a", "b"]);
+    assert!(matches!(results[0], Ok(Outcome::Processed(()))));
+    assert!(matches!(results[1], Ok(Outcome::Processed(()))));
+    assert!(matches!(results[2], Ok(Outcome::Duplicate)));
+}

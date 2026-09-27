@@ -4,8 +4,13 @@ use std::time::Duration;
 use tracing::Instrument;
 
 use crate::error::{HandlerError, InboxError};
-use crate::store::{BoxFuture, InboxStore, LockTimeout};
+use crate::store::{BoxFuture, InboxStore, LockTimeout, Savepoints};
 use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId, Outcome};
+
+/// What [`Consumer::process_many`] reports for one message: its outcome, or
+/// the error its handler returned (that message was rolled back and stays
+/// unclaimed).
+pub type ProcessResult<T> = Result<Outcome<T>, HandlerError>;
 
 /// One logical consumer of one stream.
 ///
@@ -48,6 +53,68 @@ impl<S: LockTimeout> Consumer<S> {
     pub fn with_lock_timeout(mut self, timeout: Duration) -> Self {
         self.lock_timeout = Some(timeout);
         self
+    }
+}
+
+impl<S: Savepoints> Consumer<S> {
+    /// Runs `handler` once for every distinct, unprocessed id in `ids`, all
+    /// in one transaction.
+    ///
+    /// Each handler runs inside a savepoint. When one fails, its effects and
+    /// its claim roll back and the rest of the batch still commits, so a
+    /// poison message costs only itself. The result is aligned with `ids`:
+    /// `Ok(Outcome)` per message, or that message's handler error, ready to
+    /// map onto a per-message ack or nack.
+    ///
+    /// The outer `Err` is a backend failure: nothing was committed.
+    pub fn process_many<'a, F, T>(
+        &'a self,
+        ids: &'a [MessageId],
+        mut handler: F,
+    ) -> BoxFuture<'a, Result<Vec<ProcessResult<T>>, InboxError>>
+    where
+        F: for<'c> FnMut(&'c mut S::Conn, &'c MessageId) -> BoxFuture<'c, Result<T, HandlerError>>
+            + Send
+            + 'a,
+        T: Send + 'a,
+    {
+        let span =
+            tracing::debug_span!("inbox.process_many", consumer = %self.id, count = ids.len());
+        Box::pin(
+            async move {
+                let mut tx = self.store.begin().await?;
+                let claims = self.claim_many(&mut tx, ids).await?;
+                let mut pending = claims.iter().filter(|c| **c == Claim::Fresh).count();
+                let mut results = Vec::with_capacity(ids.len());
+
+                if pending > 0 {
+                    self.store.savepoint(&mut tx).await?;
+                }
+                for (id, claim) in ids.iter().zip(claims) {
+                    if claim == Claim::Duplicate {
+                        results.push(Ok(Outcome::Duplicate));
+                        continue;
+                    }
+                    pending -= 1;
+                    match handler(&mut tx, id).await {
+                        Ok(value) => results.push(Ok(Outcome::Processed(value))),
+                        Err(e) => {
+                            self.store.rollback_to(&mut tx).await?;
+                            self.store.unclaim(&mut tx, &self.id, id).await?;
+                            results.push(Err(e));
+                        }
+                    }
+                    if pending > 0 {
+                        self.store.release_and_savepoint(&mut tx).await?;
+                    } else {
+                        self.store.release(&mut tx).await?;
+                    }
+                }
+                self.store.commit(tx).await?;
+                Ok(results)
+            }
+            .instrument(span),
+        )
     }
 }
 
