@@ -212,3 +212,147 @@ async fn a_deadlock_victim_gets_contended() {
         errors[0]
     );
 }
+
+/// One pool, one connection: txbox and a plain query share it, as they do
+/// in an application that hands txbox its only pool.
+async fn one_connection_inbox(
+    after_connect_timeout: Option<u64>,
+) -> (ContainerAsync<MysqlImage>, MySqlInbox, String) {
+    let container = MysqlImage::default()
+        .with_tag("8.4")
+        .start()
+        .await
+        .expect("start mysql");
+    let port = container.get_host_port_ipv4(3306).await.expect("map port");
+    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |conn, _| {
+            Box::pin(async move {
+                if let Some(secs) = after_connect_timeout {
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "SET SESSION innodb_lock_wait_timeout = {secs}"
+                    )))
+                    .execute(conn)
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .connect(&url)
+        .await
+        .expect("connect to mysql");
+    let inbox = MySqlInbox::new(pool);
+    inbox.migrate().await.expect("run migrations");
+    (container, inbox, url)
+}
+
+async fn session_lock_timeout(inbox: &MySqlInbox) -> u64 {
+    sqlx::query_scalar("SELECT @@SESSION.innodb_lock_wait_timeout")
+        .fetch_one(inbox.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_lock_timeout_does_not_leak_to_other_users_of_the_pool() {
+    let (_container, inbox, _url) = one_connection_inbox(None).await;
+    let consumer = inbox
+        .consumer(ConsumerId::try_from("leak").unwrap())
+        .with_lock_timeout(Duration::from_secs(1));
+    let ids = [MessageId::try_from("a").unwrap()];
+
+    let mut tx = consumer.begin().await.unwrap();
+    consumer.claim(&mut tx, &ids[0]).await.unwrap();
+    consumer.claim_many(&mut tx, &ids).await.unwrap();
+    consumer.commit(tx).await.unwrap();
+
+    assert_eq!(
+        session_lock_timeout(&inbox).await,
+        50,
+        "a plain query inherited txbox's timeout"
+    );
+}
+
+#[tokio::test]
+async fn a_session_lock_timeout_set_by_the_application_is_kept() {
+    let (_container, inbox, _url) = one_connection_inbox(Some(7)).await;
+    let consumer = inbox.consumer(ConsumerId::try_from("kept").unwrap());
+
+    let mut tx = consumer.begin().await.unwrap();
+    consumer.commit(tx).await.unwrap();
+    assert_eq!(
+        session_lock_timeout(&inbox).await,
+        7,
+        "BEGIN overwrote the application's value"
+    );
+
+    let consumer = consumer.with_lock_timeout(Duration::from_secs(1));
+    tx = consumer.begin().await.unwrap();
+    consumer
+        .claim(&mut tx, &MessageId::try_from("a").unwrap())
+        .await
+        .unwrap();
+    consumer.commit(tx).await.unwrap();
+    assert_eq!(
+        session_lock_timeout(&inbox).await,
+        7,
+        "the claim didn't restore the application's value"
+    );
+}
+
+#[tokio::test]
+async fn a_contended_claim_still_restores_the_lock_timeout() {
+    let (_container, inbox, url) = one_connection_inbox(None).await;
+    // The holder sits on its own pool, so the inbox's only connection is free.
+    let holder = MySqlInbox::new(
+        MySqlPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap(),
+    );
+    let consumer_id = ConsumerId::try_from("contended").unwrap();
+    let id = MessageId::try_from("m").unwrap();
+    let holding = holder.consumer(consumer_id.clone());
+    let mut held = holding.begin().await.unwrap();
+    holding.claim(&mut held, &id).await.unwrap();
+
+    let consumer = inbox
+        .consumer(consumer_id)
+        .with_lock_timeout(Duration::from_secs(1));
+    let mut tx = consumer.begin().await.unwrap();
+    let result = consumer.claim(&mut tx, &id).await;
+    drop(tx);
+
+    assert!(
+        matches!(result, Err(txbox::InboxError::Contended)),
+        "got {result:?}"
+    );
+    assert_eq!(
+        session_lock_timeout(&inbox).await,
+        50,
+        "the error path left txbox's timeout behind"
+    );
+    holding.rollback(held).await.unwrap();
+}
+
+/// A claim cancelled between setting its timeout and restoring it leaves
+/// the saved value behind; the next BEGIN must put it back.
+#[tokio::test]
+async fn begin_restores_a_lock_timeout_left_by_a_cancelled_claim() {
+    let (_container, inbox, _url) = one_connection_inbox(Some(7)).await;
+    // The state a claim cancelled mid-way leaves on the connection.
+    sqlx::raw_sql(
+        "SET @txbox_lock_wait_timeout = @@SESSION.innodb_lock_wait_timeout, \
+             SESSION innodb_lock_wait_timeout = 1",
+    )
+    .execute(inbox.pool())
+    .await
+    .unwrap();
+
+    let tx = inbox.begin().await.unwrap();
+    inbox.rollback(tx).await.unwrap();
+
+    assert_eq!(session_lock_timeout(&inbox).await, 7);
+}

@@ -30,11 +30,21 @@ const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
 /// `ER_LOCK_DEADLOCK`: this transaction was the deadlock victim.
 const ER_LOCK_DEADLOCK: u16 = 1213;
 
-// A lock timeout is a session variable and outlives the transaction that set
-// it (MySQL ignores the per-statement SET_VAR hint for it). Every
-// transaction therefore starts by resetting it, in BEGIN's own round-trip,
-// so one consumer's timeout never reaches the next user of the connection.
-const BEGIN_SQL: &str = "SET SESSION innodb_lock_wait_timeout = DEFAULT; BEGIN";
+// A lock timeout is a session variable: it outlives the statement and the
+// transaction that set it (MySQL ignores the per-statement SET_VAR hint for
+// it), and the pool may be shared with code that isn't txbox. So a claim
+// saves the session's own value, sets its timeout, and restores the saved
+// value right after the statement, on success or error. A claim cancelled in
+// between leaves the saved value behind, and the next BEGIN puts it back in
+// the same round-trip; with nothing saved, BEGIN changes nothing, so a value
+// the application set in `after_connect` survives. The casts are needed:
+// a user variable once set to NULL no longer passes as an integer.
+const BEGIN_SQL: &str = "SET SESSION innodb_lock_wait_timeout = \
+                             CAST(COALESCE(@txbox_lock_wait_timeout, @@SESSION.innodb_lock_wait_timeout) AS UNSIGNED), \
+                         @txbox_lock_wait_timeout = NULL; \
+                         BEGIN";
+const RESTORE_LOCK_TIMEOUT_SQL: &str = "SET SESSION innodb_lock_wait_timeout = CAST(@txbox_lock_wait_timeout AS UNSIGNED), \
+                                        @txbox_lock_wait_timeout = NULL";
 
 // `INSERT IGNORE`, not a no-op `ON DUPLICATE KEY UPDATE`: sqlx always sets
 // CLIENT_FOUND_ROWS, under which the latter reports one affected row for a
@@ -81,6 +91,35 @@ const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
 fn mysql_lock_timeout(timeout: Duration) -> u64 {
     let secs = timeout.as_nanos().div_ceil(1_000_000_000).max(1);
     u64::try_from(secs).unwrap_or(u64::MAX).min(1_073_741_824)
+}
+
+async fn set_lock_timeout(
+    conn: &mut MySqlConnection,
+    timeout: Option<Duration>,
+) -> Result<(), sqlx::Error> {
+    if let Some(timeout) = timeout {
+        // An integer, so formatting it into the statement is safe.
+        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+            "SET @txbox_lock_wait_timeout = @@SESSION.innodb_lock_wait_timeout, \
+                 SESSION innodb_lock_wait_timeout = {}",
+            mysql_lock_timeout(timeout)
+        )))
+        .execute(conn)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn restore_lock_timeout(
+    conn: &mut MySqlConnection,
+    timeout: Option<Duration>,
+) -> Result<(), sqlx::Error> {
+    if timeout.is_some() {
+        sqlx::raw_sql(RESTORE_LOCK_TIMEOUT_SQL)
+            .execute(conn)
+            .await?;
+    }
+    Ok(())
 }
 
 /// Both errors mean another consumer holds the row: retryable contention,
@@ -158,23 +197,16 @@ impl InboxStore for MySqlInbox {
         );
         Box::pin(
             async move {
-                if let Some(timeout) = lock_timeout {
-                    // An integer, so formatting it into the statement is safe.
-                    // Reset by the next BEGIN (see BEGIN_SQL).
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                        "SET SESSION innodb_lock_wait_timeout = {}",
-                        mysql_lock_timeout(timeout)
-                    )))
-                    .execute(&mut *conn)
-                    .await?;
-                }
-                let affected = sqlx::query(CLAIM_SQL)
+                set_lock_timeout(&mut *conn, lock_timeout).await?;
+                let result = sqlx::query(CLAIM_SQL)
                     .bind(consumer.as_str())
                     .bind(id.as_str())
                     .execute(&mut *conn)
-                    .await
-                    .map_err(claim_error)?
-                    .rows_affected();
+                    .await;
+                // Restored on the error path too; the claim's error wins.
+                let restored = restore_lock_timeout(&mut *conn, lock_timeout).await;
+                let affected = result.map_err(claim_error)?.rows_affected();
+                restored?;
                 Ok(if affected == 1 {
                     Claim::Fresh
                 } else {
@@ -198,25 +230,18 @@ impl InboxStore for MySqlInbox {
         );
         Box::pin(
             async move {
-                if let Some(timeout) = batch.lock_timeout {
-                    // An integer, so formatting it into the statement is safe.
-                    // Reset by the next BEGIN (see BEGIN_SQL).
-                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-                        "SET SESSION innodb_lock_wait_timeout = {}",
-                        mysql_lock_timeout(timeout)
-                    )))
-                    .execute(&mut *conn)
-                    .await?;
-                }
                 let token = getrandom::u64().map_err(|e| InboxError::Backend(Box::new(e)))?;
                 let ids: Vec<&str> = batch.ids.iter().map(|id| id.as_str()).collect();
-                sqlx::query(CLAIM_MANY_SQL)
+                set_lock_timeout(&mut *conn, batch.lock_timeout).await?;
+                let result = sqlx::query(CLAIM_MANY_SQL)
                     .bind(batch.consumer.as_str())
                     .bind(token)
                     .bind(Json(&ids))
                     .execute(&mut *conn)
-                    .await
-                    .map_err(claim_error)?;
+                    .await;
+                let restored = restore_lock_timeout(&mut *conn, batch.lock_timeout).await;
+                result.map_err(claim_error)?;
+                restored?;
                 let fresh: Vec<String> = sqlx::query_scalar(CLAIMED_BY_TOKEN_SQL)
                     .bind(Json(&ids))
                     .bind(batch.consumer.as_str())
