@@ -19,11 +19,12 @@ sqlx = { version = "0.9", optional = true, default-features = false }
 thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+getrandom = { version = "0.4", optional = true }
 rdkafka = { version = "0.39", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
 tracing-subscriber = "0.3"
 
 [features]
@@ -34,6 +35,9 @@ default = ["runtime-tokio"]
 runtime-tokio = ["sqlx?/runtime-tokio"]
 postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
 sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros", "sqlx/json"]
+# Plaintext connections to MySQL 8.4 need sqlx's `mysql-rsa` feature for
+# password auth; it is left to you (TLS is the production norm).
+mysql = ["dep:sqlx", "dep:getrandom", "sqlx/mysql", "sqlx/chrono", "sqlx/migrate", "sqlx/macros", "sqlx/json"]
 # Exposes `txbox::testing::conformance` for backend authors. No dependencies.
 testing = []
 example-kafka = ["dep:rdkafka", "postgres"]
@@ -43,5 +47,5 @@ name = "kafka_consumer"
 required-features = ["example-kafka"]
 
 [package.metadata.docs.rs]
-features = ["postgres", "sqlite", "testing"]
+features = ["postgres", "sqlite", "mysql", "testing"]
 rustdoc-args = ["--cfg", "docsrs"]

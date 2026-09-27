@@ -1,7 +1,7 @@
 //! Transactional inbox pattern for reliable message processing.
 //!
-//! Backends are selected with the `postgres` and `sqlite` Cargo features;
-//! neither is enabled by default.
+//! Backends are selected with the `postgres`, `sqlite` and `mysql` Cargo
+//! features; none is enabled by default.
 //!
 //! The README follows, included so its examples compile as doctests. Gated
 //! on `postgres` since the examples use that backend.
@@ -13,12 +13,18 @@
 /// The `sqlx` version this crate was built against. Re-exported so handlers
 /// writing their own SQL can reach it as `txbox::sqlx` without declaring the
 /// dependency twice.
-#[cfg(any(feature = "postgres", feature = "sqlite"))]
-#[cfg_attr(docsrs, doc(cfg(any(feature = "postgres", feature = "sqlite"))))]
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
+#[cfg_attr(
+    docsrs,
+    doc(cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql")))
+)]
 pub use sqlx;
 
 mod consumer;
 mod error;
+#[cfg(feature = "mysql")]
+#[cfg_attr(docsrs, doc(cfg(feature = "mysql")))]
+pub mod mysql;
 #[cfg(feature = "postgres")]
 #[cfg_attr(docsrs, doc(cfg(feature = "postgres")))]
 pub mod postgres;

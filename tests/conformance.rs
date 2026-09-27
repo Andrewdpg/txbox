@@ -231,3 +231,43 @@ async fn postgres_passes_savepoints_conformance() {
     inbox.migrate().await.expect("run migrations");
     txbox::testing::savepoints_conformance(inbox).await;
 }
+
+#[cfg(feature = "mysql")]
+async fn mysql_one_connection() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<testcontainers_modules::mysql::Mysql>,
+    txbox::mysql::MySqlInbox,
+) {
+    use sqlx::mysql::MySqlPoolOptions;
+    use testcontainers_modules::mysql::Mysql as MysqlImage;
+    use testcontainers_modules::testcontainers::ImageExt;
+    use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+    let container = MysqlImage::default()
+        .with_tag("8.4")
+        .start()
+        .await
+        .expect("start mysql");
+    let port = container.get_host_port_ipv4(3306).await.expect("map port");
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&format!("mysql://root@127.0.0.1:{port}/test"))
+        .await
+        .expect("connect to mysql");
+    let inbox = txbox::mysql::MySqlInbox::new(pool);
+    inbox.migrate().await.expect("run migrations");
+    (container, inbox)
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_passes_conformance() {
+    let (_container, inbox) = mysql_one_connection().await;
+    conformance(inbox).await;
+}
+
+#[cfg(feature = "mysql")]
+#[tokio::test]
+async fn mysql_passes_savepoints_conformance() {
+    let (_container, inbox) = mysql_one_connection().await;
+    txbox::testing::savepoints_conformance(inbox).await;
+}

@@ -22,6 +22,8 @@ This project is pre-1.0: breaking changes may land in any minor release.
   SQLite): per-message savepoints, so a failing handler costs only its
   own message. Its per-message result is `ProcessResult<T>`.
 - `txbox::testing::savepoints_conformance`.
+- MySQL backend behind the `mysql` feature (MySQL 8.0.4+), with
+  `claim_many`, lock timeouts (whole seconds) and `process_many`.
 
 ### Changed
 

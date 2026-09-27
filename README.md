@@ -66,8 +66,9 @@ Import both: `InboxStore` for `migrate`/`purge`, `InboxExt` for
 |------------|------------|------------|
 | PostgreSQL | `postgres` | `sqlx` 0.9 |
 | SQLite     | `sqlite`   | `sqlx` 0.9 |
+| MySQL      | `mysql`    | `sqlx` 0.9 |
 
-Neither is enabled by default. `sqlx` is re-exported as `txbox::sqlx`, so
+None is enabled by default. `sqlx` is re-exported as `txbox::sqlx`, so
 handlers writing their own SQL stay on the same version.
 
 sqlx runs on tokio through the default `runtime-tokio` feature. For another
@@ -77,6 +78,10 @@ runtime, turn defaults off and pick it on sqlx:
 txbox = { version = "0.2", default-features = false, features = ["sqlite"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-smol"] }
 ```
+
+MySQL needs 8.0.4 or later. Over a plaintext connection, MySQL 8's default
+password authentication needs sqlx's `mysql-rsa` feature; txbox doesn't
+turn it on for you. Use TLS, or add `sqlx = { version = "0.9", features = ["mysql-rsa"] }`.
 
 ## Read before you rely on this
 
@@ -124,6 +129,13 @@ tooling instead of calling `migrate()`.
 ### SQLite
 
 Same shape, with `processed_at TEXT`. Also exposed as `sqlite::MIGRATION_SQL`.
+
+### MySQL
+
+Same shape, with `VARCHAR` ids, `processed_at DATETIME(6)` and a
+`claim_token` column used by `claim_many`. The table is `utf8mb4_bin`: MySQL's
+default collation ignores case and accents, which would merge distinct
+message ids. Also exposed as `mysql::MIGRATION_SQL`.
 
 Running a per-tenant schema? See [`docs/guide.md`](docs/guide.md#multi-tenant-schemas).
 

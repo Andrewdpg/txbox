@@ -1,0 +1,356 @@
+//! MySQL implementation of [`InboxStore`].
+//!
+//! Needs MySQL 8.0.4+ (`JSON_TABLE`). The table uses `utf8mb4_bin` because
+//! MySQL's default collation compares case- and accent-insensitively, which
+//! would merge distinct message ids.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use sqlx::migrate::Migrator;
+use sqlx::mysql::MySqlDatabaseError;
+use sqlx::types::Json;
+use sqlx::{MySql, MySqlConnection, MySqlPool, Transaction};
+use tracing::Instrument;
+
+use crate::error::InboxError;
+use crate::retention::RetentionPolicy;
+use crate::store::{BoxFuture, InboxStore, LockTimeout, Savepoints};
+use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
+
+static MIGRATOR: Migrator = sqlx::migrate!("migrations/mysql");
+
+/// The exact DDL `migrate()` applies on MySQL. Sourced with `include_str!`
+/// from the same file `MIGRATOR` runs.
+pub const MIGRATION_SQL: &str =
+    include_str!("../migrations/mysql/20260926000001_create_inbox_messages.sql");
+
+/// `ER_LOCK_WAIT_TIMEOUT`: `innodb_lock_wait_timeout` expired.
+const ER_LOCK_WAIT_TIMEOUT: u16 = 1205;
+/// `ER_LOCK_DEADLOCK`: this transaction was the deadlock victim.
+const ER_LOCK_DEADLOCK: u16 = 1213;
+
+// A lock timeout is a session variable and outlives the transaction that set
+// it (MySQL ignores the per-statement SET_VAR hint for it). Every
+// transaction therefore starts by resetting it, in BEGIN's own round-trip,
+// so one consumer's timeout never reaches the next user of the connection.
+const BEGIN_SQL: &str = "SET SESSION innodb_lock_wait_timeout = DEFAULT; BEGIN";
+
+// `INSERT IGNORE`, not a no-op `ON DUPLICATE KEY UPDATE`: sqlx always sets
+// CLIENT_FOUND_ROWS, under which the latter reports one affected row for a
+// duplicate as well as for a fresh insert. IGNORE reports 1 and 0. The errors
+// IGNORE would downgrade (length, nulls) are ruled out by id validation, and
+// lock errors still raise.
+const CLAIM_SQL: &str = "INSERT IGNORE INTO inbox_messages (consumer_id, message_id, processed_at) \
+                         VALUES (?, ?, UTC_TIMESTAMP(6))";
+
+// MySQL has no RETURNING. Fresh rows are stamped with a token unique to this
+// call and read back through the primary key. The token must never repeat:
+// if two calls shared one, a row the first claimed would read as fresh to
+// the second. `ORDER BY` pins the lock order, as on PostgreSQL.
+const CLAIM_MANY_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at, claim_token) \
+     SELECT ?, j.id, UTC_TIMESTAMP(6), ? \
+     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) AS j \
+     ORDER BY j.id \
+     ON DUPLICATE KEY UPDATE consumer_id = inbox_messages.consumer_id";
+
+const CLAIMED_BY_TOKEN_SQL: &str = "SELECT m.message_id \
+     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) AS j \
+     JOIN inbox_messages m ON m.consumer_id = ? AND m.message_id = j.id \
+     WHERE m.claim_token = ?";
+
+const SAVEPOINT_SQL: &str = "SAVEPOINT txbox_process_many";
+// Two statements in one round-trip; the driver enables MULTI_STATEMENTS.
+const RELEASE_AND_SAVEPOINT_SQL: &str =
+    "RELEASE SAVEPOINT txbox_process_many; SAVEPOINT txbox_process_many";
+const RELEASE_SQL: &str = "RELEASE SAVEPOINT txbox_process_many";
+const ROLLBACK_TO_SQL: &str = "ROLLBACK TO SAVEPOINT txbox_process_many";
+const UNCLAIM_SQL: &str = "DELETE FROM inbox_messages WHERE consumer_id = ? AND message_id = ?";
+
+const PURGE_SQL: &str = "DELETE FROM inbox_messages \
+                         WHERE processed_at < UTC_TIMESTAMP(6) - INTERVAL ? MICROSECOND \
+                         ORDER BY processed_at LIMIT ?";
+
+const KNOWN_DUPLICATE_SQL: &str = "SELECT EXISTS ( \
+                                       SELECT 1 FROM inbox_messages \
+                                       WHERE consumer_id = ? AND message_id = ? \
+                                   )";
+
+/// `innodb_lock_wait_timeout` for `timeout`: whole seconds, rounded up, at
+/// least 1 (MySQL stores 0 as 1 anyway) and at most MySQL's maximum.
+fn mysql_lock_timeout(timeout: Duration) -> u64 {
+    let secs = timeout.as_nanos().div_ceil(1_000_000_000).max(1);
+    u64::try_from(secs).unwrap_or(u64::MAX).min(1_073_741_824)
+}
+
+/// Both errors mean another consumer holds the row: retryable contention,
+/// not a backend failure.
+fn claim_error(e: sqlx::Error) -> InboxError {
+    if let sqlx::Error::Database(db) = &e
+        && let Some(mysql) = db.try_downcast_ref::<MySqlDatabaseError>()
+        && matches!(mysql.number(), ER_LOCK_WAIT_TIMEOUT | ER_LOCK_DEADLOCK)
+    {
+        return InboxError::Contended;
+    }
+    e.into()
+}
+
+/// An inbox backed by MySQL.
+#[derive(Debug, Clone)]
+pub struct MySqlInbox {
+    pool: MySqlPool,
+}
+
+impl MySqlInbox {
+    /// Wraps an existing pool.
+    pub fn new(pool: MySqlPool) -> Self {
+        Self { pool }
+    }
+
+    /// Borrows the underlying pool.
+    pub fn pool(&self) -> &MySqlPool {
+        &self.pool
+    }
+
+    /// Applies this crate's migrations.
+    ///
+    /// Call it explicitly, from your deployment path. A library must never
+    /// alter a production schema on its own at startup.
+    pub async fn migrate(&self) -> Result<(), InboxError> {
+        MIGRATOR
+            .run(&self.pool)
+            .await
+            .map_err(|e| InboxError::Backend(Box::new(e)))
+    }
+}
+
+impl InboxStore for MySqlInbox {
+    type Conn = MySqlConnection;
+    type Tx = Transaction<'static, MySql>;
+
+    fn begin(&self) -> BoxFuture<'_, Result<Self::Tx, InboxError>> {
+        Box::pin(async move { Ok(self.pool.begin_with(BEGIN_SQL).await?) })
+    }
+
+    fn commit(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        Box::pin(async move { Ok(tx.commit().await?) })
+    }
+
+    fn rollback(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        Box::pin(async move { Ok(tx.rollback().await?) })
+    }
+
+    fn claim<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        request: ClaimRequest<'a>,
+    ) -> BoxFuture<'a, Result<Claim, InboxError>> {
+        let ClaimRequest {
+            consumer,
+            id,
+            lock_timeout,
+        } = request;
+        let span = tracing::debug_span!(
+            "inbox.claim",
+            consumer = %consumer,
+            message_id = %id,
+            backend = "mysql"
+        );
+        Box::pin(
+            async move {
+                if let Some(timeout) = lock_timeout {
+                    // An integer, so formatting it into the statement is safe.
+                    // Reset by the next BEGIN (see BEGIN_SQL).
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "SET SESSION innodb_lock_wait_timeout = {}",
+                        mysql_lock_timeout(timeout)
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
+                }
+                let affected = sqlx::query(CLAIM_SQL)
+                    .bind(consumer.as_str())
+                    .bind(id.as_str())
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(claim_error)?
+                    .rows_affected();
+                Ok(if affected == 1 {
+                    Claim::Fresh
+                } else {
+                    Claim::Duplicate
+                })
+            }
+            .instrument(span),
+        )
+    }
+
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        let span = tracing::debug_span!(
+            "inbox.claim_many",
+            consumer = %batch.consumer,
+            count = batch.ids.len(),
+            backend = "mysql"
+        );
+        Box::pin(
+            async move {
+                if let Some(timeout) = batch.lock_timeout {
+                    // An integer, so formatting it into the statement is safe.
+                    // Reset by the next BEGIN (see BEGIN_SQL).
+                    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                        "SET SESSION innodb_lock_wait_timeout = {}",
+                        mysql_lock_timeout(timeout)
+                    )))
+                    .execute(&mut *conn)
+                    .await?;
+                }
+                let token = getrandom::u64().map_err(|e| InboxError::Backend(Box::new(e)))?;
+                let ids: Vec<&str> = batch.ids.iter().map(|id| id.as_str()).collect();
+                sqlx::query(CLAIM_MANY_SQL)
+                    .bind(batch.consumer.as_str())
+                    .bind(token)
+                    .bind(Json(&ids))
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(claim_error)?;
+                let fresh: Vec<String> = sqlx::query_scalar(CLAIMED_BY_TOKEN_SQL)
+                    .bind(Json(&ids))
+                    .bind(batch.consumer.as_str())
+                    .bind(token)
+                    .fetch_all(&mut *conn)
+                    .await?;
+                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        if fresh.contains(id) {
+                            Claim::Fresh
+                        } else {
+                            Claim::Duplicate
+                        }
+                    })
+                    .collect())
+            }
+            .instrument(span),
+        )
+    }
+
+    fn is_known_duplicate<'a>(
+        &'a self,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<bool, InboxError>> {
+        let span = tracing::debug_span!(
+            "inbox.is_known_duplicate",
+            consumer = %consumer,
+            message_id = %id,
+            backend = "mysql"
+        );
+        Box::pin(
+            async move {
+                let known: bool = sqlx::query_scalar(KNOWN_DUPLICATE_SQL)
+                    .bind(consumer.as_str())
+                    .bind(id.as_str())
+                    .fetch_one(&self.pool)
+                    .await?;
+                Ok(known)
+            }
+            .instrument(span),
+        )
+    }
+
+    fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>> {
+        Box::pin(async move {
+            let max_age = u64::try_from(policy.max_age().as_micros()).unwrap_or(u64::MAX);
+            let batch = policy.batch_size();
+
+            let mut total = 0u64;
+            loop {
+                let affected = sqlx::query(PURGE_SQL)
+                    .bind(max_age)
+                    .bind(batch)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+
+                total += affected;
+                if affected < u64::from(batch) {
+                    break;
+                }
+            }
+            Ok(total)
+        })
+    }
+}
+
+impl LockTimeout for MySqlInbox {}
+
+impl Savepoints for MySqlInbox {
+    fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async move { Ok(sqlx::raw_sql(SAVEPOINT_SQL).execute(conn).await.map(drop)?) })
+    }
+
+    fn release_and_savepoint<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+    ) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async move {
+            Ok(sqlx::raw_sql(RELEASE_AND_SAVEPOINT_SQL)
+                .execute(conn)
+                .await
+                .map(drop)?)
+        })
+    }
+
+    fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async move { Ok(sqlx::raw_sql(RELEASE_SQL).execute(conn).await.map(drop)?) })
+    }
+
+    fn rollback_to<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+    ) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async move {
+            Ok(sqlx::raw_sql(ROLLBACK_TO_SQL)
+                .execute(conn)
+                .await
+                .map(drop)?)
+        })
+    }
+
+    fn unclaim<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), InboxError>> {
+        Box::pin(async move {
+            sqlx::query(UNCLAIM_SQL)
+                .bind(consumer.as_str())
+                .bind(id.as_str())
+                .execute(conn)
+                .await?;
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::mysql_lock_timeout;
+
+    #[test]
+    fn lock_timeout_rounds_up_to_whole_seconds_and_never_zero() {
+        assert_eq!(mysql_lock_timeout(Duration::ZERO), 1);
+        assert_eq!(mysql_lock_timeout(Duration::from_millis(1)), 1);
+        assert_eq!(mysql_lock_timeout(Duration::from_millis(1001)), 2);
+        assert_eq!(mysql_lock_timeout(Duration::from_secs(30)), 30);
+        assert_eq!(mysql_lock_timeout(Duration::MAX), 1_073_741_824);
+    }
+}

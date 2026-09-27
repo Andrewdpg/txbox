@@ -28,7 +28,7 @@ jobs:
       # dependent sees before choosing one. It has to stand on its own.
       - run: cargo clippy --all-targets -- -D warnings
 
-      - run: cargo clippy --all-targets --features postgres,sqlite,testing -- -D warnings
+      - run: cargo clippy --all-targets --features postgres,sqlite,mysql,testing -- -D warnings
 
       # sqlx is optional. A crate that only implements `InboxStore` selects no
       # backend and must not compile sqlx at all.
@@ -47,7 +47,7 @@ jobs:
 
       # The README is included as crate documentation, so a link that breaks in
       # it fails here rather than silently on docs.rs.
-      - run: cargo doc --no-deps --features postgres,sqlite,testing
+      - run: cargo doc --no-deps --features postgres,sqlite,mysql,testing
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -60,7 +60,7 @@ jobs:
         # Each backend is exercised alone, not only in combination. Modules
         # behind separate features can compile together and still fail
         # individually, and a dependent enables exactly one.
-        features: [postgres, sqlite]
+        features: [postgres, sqlite, mysql]
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
