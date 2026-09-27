@@ -16,6 +16,12 @@ This project is pre-1.0: breaking changes may land in any minor release.
   handler fails.
 - `testing` feature with `txbox::testing::conformance`, a suite backend
   authors run against their own `InboxStore`.
+- `Consumer::claim_many` and `InboxStore::claim_many` (default: one claim
+  per id; one statement on PostgreSQL and SQLite).
+- `Consumer::process_many` over the new `Savepoints` trait (PostgreSQL,
+  SQLite): per-message savepoints, so a failing handler costs only its
+  own message. Its per-message result is `ProcessResult<T>`.
+- `txbox::testing::savepoints_conformance`.
 
 ### Changed
 
@@ -23,6 +29,9 @@ This project is pre-1.0: breaking changes may land in any minor release.
   new `LockTimeout` trait. It used to compile on SQLite and silently do
   nothing; now it doesn't compile there. Generic code that calls it needs an
   `S: LockTimeout` bound.
+- PostgreSQL: a deadlock victim (`40P01`) during a claim now returns
+  `InboxError::Contended` instead of `InboxError::Backend`.
+- The `sqlite` feature enables sqlx's `json` feature.
 - `sqlx` is now optional and only pulled in by a backend feature. The tokio
   runtime moved to a `runtime-tokio` feature, on by default. If you set
   `default-features = false`, add `features = ["runtime-tokio", ...]` or
