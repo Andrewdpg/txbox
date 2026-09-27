@@ -16,27 +16,21 @@ This project is pre-1.0: breaking changes may land in any minor release.
   handler fails.
 - `testing` feature with `txbox::testing::conformance`, a suite backend
   authors run against their own `InboxStore`.
-- `Consumer::claim_many` and `InboxStore::claim_many` (default: one claim
-  per id; one statement on PostgreSQL and SQLite, two on MySQL), with
-  `ClaimBatch` and its `with_lock_timeout` builder.
-- `Consumer::process_many` over the new `Savepoints` trait (PostgreSQL,
-  SQLite): per-message savepoints, so a failing handler costs only its
-  own message. Its per-message result is `ProcessResult<T>`.
+- `Consumer::claim_many` and `InboxStore::claim_many`, with `ClaimBatch`.
+- `Consumer::process_many` over the new `Savepoints` trait, returning one
+  `ProcessResult<T>` per message.
 - `txbox::testing::savepoints_conformance`.
 - MySQL backend behind the `mysql` feature (MySQL 8.0.17+), with
   `claim_many`, lock timeouts (whole seconds) and `process_many`.
 
 ### Changed
 
-- `Consumer::with_lock_timeout` now requires the backend to implement the
-  new `LockTimeout` trait. It used to compile on SQLite and silently do
-  nothing; now it doesn't compile there. Generic code that calls it needs an
-  `S: LockTimeout` bound.
+- `Consumer::with_lock_timeout` now requires `S: LockTimeout`. It used to
+  compile on SQLite and silently do nothing; now it doesn't compile there.
 - PostgreSQL: a deadlock victim (`40P01`) during a claim now returns
   `InboxError::Contended` instead of `InboxError::Backend`.
-- `InboxError::Contended` now reads "another consumer holds the row", since
-  it also covers deadlock victims. After it, roll the transaction back and
-  retry in a new one; on MySQL a deadlock has already rolled it back.
+- `InboxError::Contended` now also covers deadlock victims, and its message
+  reads "another consumer holds the row".
 - The `sqlite` feature enables sqlx's `json` feature.
 - SQLite: a claim refused with `SQLITE_BUSY` or `SQLITE_LOCKED` now returns
   `InboxError::Contended` instead of `InboxError::Backend`, like the other

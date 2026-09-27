@@ -79,9 +79,8 @@ txbox = { version = "0.2", default-features = false, features = ["sqlite"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-smol"] }
 ```
 
-MySQL needs 8.0.17 or later. Over a plaintext connection, MySQL 8's default
-password authentication needs sqlx's `mysql-rsa` feature; txbox doesn't
-turn it on for you. Use TLS, or add `sqlx = { version = "0.9", features = ["mysql-rsa"] }`.
+MySQL needs 8.0.17 or later, and TLS or sqlx's `mysql-rsa` feature to
+authenticate.
 
 ## Read before you rely on this
 

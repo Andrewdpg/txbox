@@ -67,7 +67,6 @@ orders.commit(tx).await?;
 Ok(()) }
 ```
 
-
 The batch is one unit of failure: if anything in it fails, the whole
 transaction rolls back and every message in it becomes unclaimed again, so
 the broker redelivers the whole batch. The transaction is also held open for
@@ -77,16 +76,15 @@ that entire span. Commit the broker's offsets only after `commit` returns.
 If a claim returns `InboxError::Contended`, roll the transaction back and
 retry the whole batch in a new one. Don't keep using it: on MySQL a
 deadlock has already rolled it back, and later statements on it commit one
-by one.
+by one. To abandon a batch, call `orders.rollback(tx)`.
 
 `claim_many` claims the whole batch in one statement (PostgreSQL `unnest`,
 SQLite `json_each`; MySQL has no `RETURNING`, so it takes two, a
-`JSON_TABLE` insert and a read-back) and answers per id, in input order. Measured on
-PostgreSQL 17 with 10,000 ids: about 91ms, against about 1s for a loop of
-`claim`. A repeated id gets `Duplicate` after its first occurrence. Row
-locks are taken in byte order, so overlapping batches from concurrent
-consumers don't deadlock. The locks are held until commit: 100,000 ids hold
-theirs for about 0.9s, which is how long a competing consumer waits.
+`JSON_TABLE` insert and a read-back) and answers per id, in input order. A
+repeated id gets `Duplicate` after its first occurrence. Row locks are taken
+in byte order, so overlapping batches from concurrent consumers don't
+deadlock, and held until commit, so a bigger batch keeps competing consumers
+waiting longer ([numbers](operations.md#batches)).
 
 When the effect can be written in bulk too, keep it to two statements:
 
@@ -109,24 +107,7 @@ orders.commit(tx).await?;
 That whole batch still fails as one unit. `process_many` runs a handler
 per message inside a savepoint instead: a failing handler rolls back only
 its own effects and claim, and you get one result per message to ack or
-nack. It costs a savepoint per message (10,000 messages: about 2.5s on
-PostgreSQL, against about 10s for one transaction each), and it needs a
-backend implementing `Savepoints`.
-
-## Parallelism
-
-txbox never spawns tasks. Run one worker per partition (Kafka), per queue
-with a single active consumer (RabbitMQ), or per poller (SQS), and give
-each its own `Consumer` clone. The database is the bottleneck, not the
-CPU: 100,000 messages in batches of 1,000 took 1.46s with one worker,
-548ms with four and 349ms with eight.
-
-Never split one Kafka partition across workers. An offset commit means
-"everything up to here is done", so committing a later offset while an
-earlier message is still in flight loses that message on a crash.
-
-To abandon a batch, call `orders.rollback(tx)`. Dropping the transaction
-also rolls it back, but the explicit call waits for it.
+nack. It needs a backend implementing `Savepoints`.
 
 ## Multi-tenant schemas
 

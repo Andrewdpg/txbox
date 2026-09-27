@@ -60,6 +60,20 @@ Unset by default (preserves blocking). Only backends that can enforce it
 implement `LockTimeout`; on SQLite the method doesn't exist, so bound the
 wait with `SqliteConnectOptions::busy_timeout` on the pool.
 
+### Batches
+
+PostgreSQL 17 in local Docker, a handler inserting one row, 10,000 messages
+in batches of 1,000:
+
+| approach | time |
+|---|---|
+| `process`, one message at a time | 10.5 s |
+| `process_many` | 1.9 s |
+| `claim_many` plus one bulk insert | 150 ms |
+
+A batch holds its row locks until commit. `claim_many` over 100,000 ids
+takes about 1 s, and a competing consumer waits that long.
+
 ### What retention costs
 
 Filling the inbox to 300 000 rows:
@@ -78,6 +92,23 @@ still occupied its full 31 MB until `VACUUM` ran. A live inbox rarely needs
 that: retention deletes the oldest rows while new ones are appended, so
 freed space is reused rather than returned. Size the disk for what
 retention holds; don't expect a purge to shrink anything.
+
+## Parallelism
+
+txbox never spawns tasks. Run one worker per partition (Kafka), per queue
+with a single active consumer (RabbitMQ), or per poller (SQS), each with its
+own `Consumer` clone. The database is the limit, not the CPU. 100,000
+messages through `claim_many` plus a bulk insert, in batches of 1,000:
+
+| workers | time |
+|---|---|
+| 1 | 1.49 s |
+| 4 | 531 ms |
+| 8 | 364 ms |
+
+Never split one Kafka partition across workers. An offset commit means
+"everything up to here is done", so committing a later offset while an
+earlier message is still in flight loses that message on a crash.
 
 ## Purge scheduling
 
