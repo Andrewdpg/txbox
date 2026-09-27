@@ -1,5 +1,6 @@
 //! PostgreSQL implementation of [`InboxStore`].
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use sqlx::migrate::Migrator;
@@ -9,11 +10,31 @@ use tracing::Instrument;
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
 use crate::store::{BoxFuture, InboxStore, LockTimeout};
-use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId};
+use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
 /// PostgreSQL's SQLSTATE for `lock_not_available`, raised when
 /// `SET LOCAL lock_timeout` expires while waiting on a contended row.
 const LOCK_NOT_AVAILABLE: &str = "55P03";
+
+/// PostgreSQL's SQLSTATE for `deadlock_detected`, raised on the victim of a
+/// lock cycle.
+const DEADLOCK_DETECTED: &str = "40P01";
+
+/// Both codes mean another consumer holds the row: retryable contention,
+/// not a backend failure.
+fn claim_error(e: sqlx::Error) -> InboxError {
+    match &e {
+        sqlx::Error::Database(db)
+            if matches!(
+                db.code().as_deref(),
+                Some(LOCK_NOT_AVAILABLE | DEADLOCK_DETECTED)
+            ) =>
+        {
+            InboxError::Contended
+        }
+        _ => e.into(),
+    }
+}
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/postgres");
 
@@ -29,6 +50,15 @@ pub const MIGRATION_SQL: &str =
 const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
                          VALUES ($1, $2, now()) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
+
+// `ORDER BY ... COLLATE "C"` fixes the lock order to byte order, the same
+// order `Consumer` sorts in, independently of how `unnest` is planned.
+// Without it, overlapping concurrent batches deadlock routinely.
+const CLAIM_MANY_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
+                              SELECT $1, id, now() FROM unnest($2::text[]) AS t(id) \
+                              ORDER BY id COLLATE \"C\" \
+                              ON CONFLICT (consumer_id, message_id) DO NOTHING \
+                              RETURNING message_id";
 
 const PURGE_SQL: &str = "DELETE FROM inbox_messages \
                          WHERE ctid IN ( \
@@ -146,21 +176,55 @@ impl InboxStore for PgInbox {
                     .execute(&mut *conn)
                     .await;
 
-                let affected = match result {
-                    Ok(done) => done.rows_affected(),
-                    Err(sqlx::Error::Database(db_err))
-                        if db_err.code().as_deref() == Some(LOCK_NOT_AVAILABLE) =>
-                    {
-                        return Err(InboxError::Contended);
-                    }
-                    Err(e) => return Err(e.into()),
-                };
+                let affected = result.map_err(claim_error)?.rows_affected();
 
                 Ok(if affected == 1 {
                     Claim::Fresh
                 } else {
                     Claim::Duplicate
                 })
+            }
+            .instrument(span),
+        )
+    }
+
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        let span = tracing::debug_span!(
+            "inbox.claim_many",
+            consumer = %batch.consumer,
+            count = batch.ids.len(),
+            backend = "postgres"
+        );
+        Box::pin(
+            async move {
+                if let Some(timeout) = batch.lock_timeout {
+                    sqlx::query(SET_LOCK_TIMEOUT_SQL)
+                        .bind(pg_lock_timeout(timeout))
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                let ids: Vec<&str> = batch.ids.iter().map(|id| id.as_str()).collect();
+                let fresh: Vec<String> = sqlx::query_scalar(CLAIM_MANY_SQL)
+                    .bind(batch.consumer.as_str())
+                    .bind(&ids)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(claim_error)?;
+                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        if fresh.contains(id) {
+                            Claim::Fresh
+                        } else {
+                            Claim::Duplicate
+                        }
+                    })
+                    .collect())
             }
             .instrument(span),
         )

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use crate::consumer::Consumer;
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
-use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId};
+use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
 /// A boxed, `Send` future.
 ///
@@ -64,6 +64,30 @@ pub trait InboxStore: Send + Sync {
         conn: &'a mut Self::Conn,
         request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>>;
+
+    /// Records every id in `batch` for its consumer on `conn`, reporting for
+    /// each, in order, whether it was new.
+    ///
+    /// `batch.ids` arrive unique and sorted by bytes; take row locks in that
+    /// order. Must return exactly one [`Claim`] per id. The default claims
+    /// them one by one; override it to do the batch in one statement.
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        Box::pin(async move {
+            let mut claims = Vec::with_capacity(batch.ids.len());
+            for id in batch.ids {
+                let request = ClaimRequest {
+                    lock_timeout: batch.lock_timeout,
+                    ..ClaimRequest::new(batch.consumer, id)
+                };
+                claims.push(self.claim(conn, request).await?);
+            }
+            Ok(claims)
+        })
+    }
 
     /// Reports whether `(consumer, id)` is already recorded, without opening a
     /// transaction.

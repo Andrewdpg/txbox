@@ -304,3 +304,21 @@ async fn a_committed_claim_is_a_known_duplicate() {
         "a committed claim must be visible to is_known_duplicate"
     );
 }
+
+#[tokio::test]
+async fn claim_many_claims_a_large_batch_in_one_call() {
+    let (_container, inbox) = inbox().await;
+    let consumer = inbox.consumer(ConsumerId::try_from("bulk").unwrap());
+    let ids: Vec<MessageId> = (0..10_000)
+        .map(|i| MessageId::try_from(format!("m{i}")).unwrap())
+        .collect();
+
+    let mut tx = consumer.begin().await.unwrap();
+    let first = consumer.claim_many(&mut tx, &ids[..5_000]).await.unwrap();
+    let second = consumer.claim_many(&mut tx, &ids).await.unwrap();
+    consumer.commit(tx).await.unwrap();
+
+    assert!(first.iter().all(|c| *c == Claim::Fresh));
+    assert!(second[..5_000].iter().all(|c| *c == Claim::Duplicate));
+    assert!(second[5_000..].iter().all(|c| *c == Claim::Fresh));
+}

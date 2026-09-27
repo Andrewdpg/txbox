@@ -24,6 +24,7 @@ pub async fn conformance<S: InboxStore + Clone + 'static>(store: S) {
     dropped_transaction_does_not_persist(&store, &run).await;
     max_length_ids_are_accepted(&store, &run).await;
     ids_compare_byte_for_byte(&store, &run).await;
+    claim_many_matches_single_claims(&store, &run).await;
 }
 
 /// Scopes one run's rows so repeated runs never see each other.
@@ -227,6 +228,41 @@ async fn ids_compare_byte_for_byte<S: InboxStore>(store: &S, run: &Run) {
             } else {
                 id
             }
+        );
+    }
+}
+
+async fn claim_many_matches_single_claims<S: InboxStore + Clone>(store: &S, run: &Run) {
+    let consumer_id = run.consumer("claim-many");
+    let consumer = store.consumer(consumer_id.clone());
+    let known = message("b");
+    assert_eq!(
+        claim_and_commit(store, &consumer_id, &known).await,
+        Claim::Fresh
+    );
+
+    let batch = [message("c"), message("b"), message("a"), message("c")];
+    let mut tx = consumer.begin().await.expect("begin");
+    let claims = consumer
+        .claim_many(&mut tx, &batch)
+        .await
+        .expect("claim_many");
+    consumer.commit(tx).await.expect("commit");
+
+    assert_eq!(
+        claims,
+        [
+            Claim::Fresh,
+            Claim::Duplicate,
+            Claim::Fresh,
+            Claim::Duplicate
+        ],
+        "claim_many must answer like one claim per id, in input order, with repeats as duplicates"
+    );
+    for id in ["a", "c"] {
+        assert!(
+            is_committed(store, &consumer_id, &message(id)).await,
+            "claim_many's fresh claims must commit"
         );
     }
 }

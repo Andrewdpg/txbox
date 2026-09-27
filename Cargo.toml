@@ -33,7 +33,7 @@ default = ["runtime-tokio"]
 # with `default-features = false` and enable another sqlx runtime yourself.
 runtime-tokio = ["sqlx?/runtime-tokio"]
 postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
-sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros", "sqlx/json"]
 # Exposes `txbox::testing::conformance` for backend authors. No dependencies.
 testing = []
 example-kafka = ["dep:rdkafka", "postgres"]

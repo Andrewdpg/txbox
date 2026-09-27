@@ -1,10 +1,11 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use tracing::Instrument;
 
 use crate::error::{HandlerError, InboxError};
 use crate::store::{BoxFuture, InboxStore, LockTimeout};
-use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId, Outcome};
+use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId, Outcome};
 
 /// One logical consumer of one stream.
 ///
@@ -92,6 +93,56 @@ impl<S: InboxStore> Consumer<S> {
             ..ClaimRequest::new(&self.id, id)
         };
         self.store.claim(conn, request)
+    }
+
+    /// Records every id in `ids` for this consumer on `conn` in one backend
+    /// call, reporting for each, in order, whether it was new. A repeated id
+    /// gets the database's answer the first time and `Duplicate` after, so a
+    /// handler can't run twice for one message. Must run on the same
+    /// connection as the effects it guards.
+    pub fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut S::Conn,
+        ids: &'a [MessageId],
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        Box::pin(async move {
+            if ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            // `str` orders by bytes, which is the order backends lock in.
+            let mut unique: Vec<&MessageId> = ids.iter().collect();
+            unique.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+            unique.dedup();
+
+            let batch = ClaimBatch {
+                lock_timeout: self.lock_timeout,
+                ..ClaimBatch::new(&self.id, &unique)
+            };
+            let claims = self.store.claim_many(conn, batch).await?;
+            if claims.len() != unique.len() {
+                return Err(InboxError::Backend(
+                    format!(
+                        "claim_many returned {} claims for {} ids",
+                        claims.len(),
+                        unique.len()
+                    )
+                    .into(),
+                ));
+            }
+
+            // The first occurrence takes the backend's answer; `insert`
+            // leaves `Duplicate` behind for every repeat.
+            let mut answers: HashMap<&str, Claim> =
+                unique.iter().map(|id| id.as_str()).zip(claims).collect();
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    answers
+                        .insert(id.as_str(), Claim::Duplicate)
+                        .expect("every id was sent to the backend")
+                })
+                .collect())
+        })
     }
 
     /// Runs `handler` exactly once for `id`.

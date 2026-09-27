@@ -259,3 +259,37 @@ async fn on_sqlite_the_loser_of_a_claim_race_is_refused_rather_than_blocked() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+#[tokio::test]
+async fn claim_many_round_trips_awkward_ids() {
+    let inbox = inbox().await;
+    let consumer = inbox.consumer(ConsumerId::try_from("odd").unwrap());
+    let raw = [
+        "q\"uote",
+        "back\\slash",
+        "\u{f1}-\u{6f22}-\u{1F600}",
+        "tab\tinside",
+        "[1,2]",
+        "{\"a\":1}",
+    ];
+    let ids: Vec<MessageId> = raw
+        .iter()
+        .map(|r| MessageId::try_from(*r).unwrap())
+        .collect();
+
+    let mut tx = consumer.begin().await.unwrap();
+    let first = consumer.claim_many(&mut tx, &ids).await.unwrap();
+    let again = consumer.claim_many(&mut tx, &ids).await.unwrap();
+    consumer.commit(tx).await.unwrap();
+
+    assert!(first.iter().all(|c| *c == Claim::Fresh), "{first:?}");
+    assert!(again.iter().all(|c| *c == Claim::Duplicate), "{again:?}");
+    let stored: Vec<String> =
+        sqlx::query_scalar("SELECT message_id FROM inbox_messages ORDER BY message_id")
+            .fetch_all(inbox.pool())
+            .await
+            .unwrap();
+    let mut want: Vec<String> = raw.iter().map(|r| r.to_string()).collect();
+    want.sort();
+    assert_eq!(stored, want, "ids must be stored byte for byte");
+}

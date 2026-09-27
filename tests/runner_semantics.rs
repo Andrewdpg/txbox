@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use txbox::{
-    BoxFuture, Claim, ClaimRequest, Consumer, ConsumerId, InboxError, InboxExt, InboxStore,
-    MessageId, Outcome, RetentionPolicy,
+    BoxFuture, Claim, ClaimBatch, ClaimRequest, Consumer, ConsumerId, InboxError, InboxExt,
+    InboxStore, MessageId, Outcome, RetentionPolicy,
 };
 
 /// A fake connection that records the business effects applied to it.
@@ -42,6 +42,8 @@ struct FakeStore {
     committed: Arc<Mutex<Vec<String>>>,
     rollbacks: Arc<Mutex<usize>>,
     fail_rollback: bool,
+    batches: Arc<Mutex<Vec<Vec<String>>>>,
+    short_batches: bool,
 }
 
 impl InboxStore for FakeStore {
@@ -83,6 +85,30 @@ impl InboxStore for FakeStore {
             } else {
                 Claim::Duplicate
             })
+        })
+    }
+
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut FakeConn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        Box::pin(async move {
+            self.batches
+                .lock()
+                .unwrap()
+                .push(batch.ids.iter().map(|id| id.as_str().to_owned()).collect());
+            let mut claims = Vec::new();
+            for id in batch.ids {
+                claims.push(
+                    self.claim(conn, ClaimRequest::new(batch.consumer, id))
+                        .await?,
+                );
+            }
+            if self.short_batches {
+                claims.pop();
+            }
+            Ok(claims)
         })
     }
 
@@ -236,4 +262,67 @@ async fn a_failing_rollback_still_reports_the_handler_error() {
         Err(InboxError::Handler(e)) => assert_eq!(e.to_string(), "boom"),
         other => panic!("expected the handler's error, got {other:?}"),
     }
+}
+
+fn ids(raw: &[&str]) -> Vec<MessageId> {
+    raw.iter()
+        .map(|id| MessageId::try_from(*id).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn claim_many_maps_repeats_to_duplicate() {
+    let store = FakeStore::default();
+    let consumer = billing(&store);
+    let mut tx = consumer.begin().await.unwrap();
+
+    let claims = consumer
+        .claim_many(&mut tx, &ids(&["b", "a", "b"]))
+        .await
+        .unwrap();
+
+    assert_eq!(claims, [Claim::Fresh, Claim::Fresh, Claim::Duplicate]);
+}
+
+#[tokio::test]
+async fn claim_many_sends_unique_sorted_ids_to_the_backend() {
+    let store = FakeStore::default();
+    let consumer = billing(&store);
+    let mut tx = consumer.begin().await.unwrap();
+
+    consumer
+        .claim_many(&mut tx, &ids(&["c", "a", "c", "b"]))
+        .await
+        .unwrap();
+
+    assert_eq!(*store.batches.lock().unwrap(), [["a", "b", "c"]]);
+}
+
+#[tokio::test]
+async fn claim_many_of_nothing_never_reaches_the_backend() {
+    let store = FakeStore::default();
+    let consumer = billing(&store);
+    let mut tx = consumer.begin().await.unwrap();
+
+    let claims = consumer.claim_many(&mut tx, &[]).await.unwrap();
+
+    assert!(claims.is_empty());
+    assert!(store.batches.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_backend_returning_too_few_claims_is_an_error() {
+    let store = FakeStore {
+        short_batches: true,
+        ..FakeStore::default()
+    };
+    let consumer = billing(&store);
+    let mut tx = consumer.begin().await.unwrap();
+
+    let result = consumer.claim_many(&mut tx, &ids(&["a", "b"])).await;
+
+    assert!(
+        matches!(result, Err(InboxError::Backend(_))),
+        "got {result:?}"
+    );
 }

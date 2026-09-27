@@ -1,14 +1,17 @@
 //! SQLite implementation of [`InboxStore`].
 
+use std::collections::HashSet;
+
 use chrono::Utc;
 use sqlx::migrate::Migrator;
+use sqlx::types::Json;
 use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 use tracing::Instrument;
 
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
 use crate::store::{BoxFuture, InboxStore};
-use crate::types::{Claim, ClaimRequest};
+use crate::types::{Claim, ClaimBatch, ClaimRequest};
 
 static MIGRATOR: Migrator = sqlx::migrate!("migrations/sqlite");
 
@@ -20,6 +23,15 @@ pub const MIGRATION_SQL: &str =
 const CLAIM_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
                          VALUES (?, ?, ?) \
                          ON CONFLICT (consumer_id, message_id) DO NOTHING";
+
+// `json_each` is SQLite's `unnest`: one bound JSON array, one statement,
+// no bind-variable limit (a multi-row VALUES fails at 100k ids). `WHERE
+// true` is required by the parser before an upsert clause on INSERT ...
+// SELECT. SQLite has one writer, so lock order doesn't matter here.
+const CLAIM_MANY_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
+                              SELECT ?, value, ? FROM json_each(?) WHERE true \
+                              ON CONFLICT (consumer_id, message_id) DO NOTHING \
+                              RETURNING message_id";
 
 // SQLite runs in the caller's process, so its clock is the caller's clock —
 // the replica-skew concern that makes PostgreSQL use `now()` doesn't apply.
@@ -119,6 +131,42 @@ impl InboxStore for SqliteInbox {
                 } else {
                     Claim::Duplicate
                 })
+            }
+            .instrument(span),
+        )
+    }
+
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        let span = tracing::debug_span!(
+            "inbox.claim_many",
+            consumer = %batch.consumer,
+            count = batch.ids.len(),
+            backend = "sqlite"
+        );
+        Box::pin(
+            async move {
+                let ids: Vec<&str> = batch.ids.iter().map(|id| id.as_str()).collect();
+                let fresh: Vec<String> = sqlx::query_scalar(CLAIM_MANY_SQL)
+                    .bind(batch.consumer.as_str())
+                    .bind(Utc::now())
+                    .bind(Json(&ids))
+                    .fetch_all(&mut *conn)
+                    .await?;
+                let fresh: HashSet<&str> = fresh.iter().map(String::as_str).collect();
+                Ok(ids
+                    .iter()
+                    .map(|id| {
+                        if fresh.contains(id) {
+                            Claim::Fresh
+                        } else {
+                            Claim::Duplicate
+                        }
+                    })
+                    .collect())
             }
             .instrument(span),
         )
