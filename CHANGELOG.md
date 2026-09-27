@@ -33,6 +33,9 @@ This project is pre-1.0: breaking changes may land in any minor release.
   `S: LockTimeout` bound.
 - PostgreSQL: a deadlock victim (`40P01`) during a claim now returns
   `InboxError::Contended` instead of `InboxError::Backend`.
+- `InboxError::Contended` now reads "another consumer holds the row", since
+  it also covers deadlock victims. After it, roll the transaction back and
+  retry in a new one; on MySQL a deadlock has already rolled it back.
 - The `sqlite` feature enables sqlx's `json` feature.
 - `sqlx` is now optional and only pulled in by a backend feature. The tokio
   runtime moved to a `runtime-tokio` feature, on by default. If you set

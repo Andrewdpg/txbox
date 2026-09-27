@@ -74,6 +74,11 @@ the broker redelivers the whole batch. The transaction is also held open for
 the whole batch, so a concurrent consumer racing for any id in it blocks for
 that entire span. Commit the broker's offsets only after `commit` returns.
 
+If a claim returns `InboxError::Contended`, roll the transaction back and
+retry the whole batch in a new one. Don't keep using it: on MySQL a
+deadlock has already rolled it back, and later statements on it commit one
+by one.
+
 `claim_many` claims the whole batch in one statement (PostgreSQL `unnest`,
 SQLite `json_each`) and answers per id, in input order. Measured on
 PostgreSQL 17 with 10,000 ids: about 91ms, against about 1s for a loop of
