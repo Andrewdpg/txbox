@@ -321,3 +321,33 @@ async fn process_many_runs_the_handler_once_per_distinct_id() {
     assert!(matches!(results[1], Ok(Outcome::Processed(()))));
     assert!(matches!(results[2], Ok(Outcome::Duplicate)));
 }
+
+/// A repeat of an id whose handler failed must not come back as
+/// `Duplicate`: a caller acking per message would ack the repeat and drop a
+/// message that was never processed.
+#[tokio::test]
+async fn process_many_reports_a_repeat_of_a_failed_id_as_failed() {
+    let inbox = inbox().await;
+    let consumer_id = ConsumerId::try_from("repeat-poison").unwrap();
+    let consumer = inbox.consumer(consumer_id.clone());
+    let ids: Vec<MessageId> = ["a", "a"]
+        .iter()
+        .map(|r| MessageId::try_from(*r).unwrap())
+        .collect();
+
+    let results = consumer
+        .process_many(&ids, |_conn, _id| {
+            Box::pin(async { Err::<(), txbox::HandlerError>("boom".into()) })
+        })
+        .await
+        .unwrap();
+
+    assert!(results.iter().all(Result::is_err), "{results:?}");
+    assert!(
+        !inbox
+            .is_known_duplicate(&consumer_id, &ids[0])
+            .await
+            .unwrap(),
+        "a failed message must stay unclaimed"
+    );
+}

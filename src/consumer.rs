@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tracing::Instrument;
@@ -86,13 +86,24 @@ impl<S: Savepoints> Consumer<S> {
                 let claims = self.claim_many(&mut tx, ids).await?;
                 let mut pending = claims.iter().filter(|c| **c == Claim::Fresh).count();
                 let mut results = Vec::with_capacity(ids.len());
+                // Ids whose handler failed. `claim_many` answers a repeat with
+                // `Duplicate`, which a caller would ack, dropping a message that
+                // was never processed; repeats of these report the failure.
+                let mut failed: HashSet<&str> = HashSet::new();
 
                 if pending > 0 {
                     self.store.savepoint(&mut tx).await?;
                 }
                 for (id, claim) in ids.iter().zip(claims) {
                     if claim == Claim::Duplicate {
-                        results.push(Ok(Outcome::Duplicate));
+                        results.push(if failed.contains(id.as_str()) {
+                            Err(
+                                format!("an earlier delivery of `{id}` in this batch failed")
+                                    .into(),
+                            )
+                        } else {
+                            Ok(Outcome::Duplicate)
+                        });
                         continue;
                     }
                     pending -= 1;
@@ -101,6 +112,7 @@ impl<S: Savepoints> Consumer<S> {
                         Err(e) => {
                             self.store.rollback_to(&mut tx).await?;
                             self.store.unclaim(&mut tx, &self.id, id).await?;
+                            failed.insert(id.as_str());
                             results.push(Err(e));
                         }
                     }

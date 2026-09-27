@@ -275,7 +275,13 @@ pub async fn savepoints_conformance<S: Savepoints + Clone + 'static>(store: S) {
     let run = Run::new();
     let inbox = run.consumer("process-many");
     let effects = run.consumer("process-many-effect");
-    let ids: Vec<MessageId> = (0..10).map(|i| message(&format!("m{i}"))).collect();
+    // A repeat of a poison must fail too, and a repeat of a success is a
+    // duplicate.
+    let ids: Vec<MessageId> = (0..10)
+        .map(|i| format!("m{i}"))
+        .chain(["m5".to_owned(), "m3".to_owned()])
+        .map(|id| message(&id))
+        .collect();
     let poisons = ["m0", "m5", "m9"];
 
     let (effect_store, effect_consumer) = (store.clone(), effects.clone());
