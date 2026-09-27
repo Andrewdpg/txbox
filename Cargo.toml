@@ -1,6 +1,6 @@
 [package]
 name = "txbox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Inherited from sqlx 0.9, whose MSRV policy sets 1.94.0 for this release
 # cycle. This is not a preference: it is the floor the dependency imposes.

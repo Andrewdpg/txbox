@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 This project is pre-1.0: breaking changes may land in any minor release.
 
-## Unreleased
+## 0.2.0 - 2026-09-26
 
 ### Added
 
@@ -39,8 +39,6 @@ This project is pre-1.0: breaking changes may land in any minor release.
   runtime moved to a `runtime-tokio` feature, on by default. If you set
   `default-features = false`, add `features = ["runtime-tokio", ...]` or
   enable another sqlx runtime, or sqlx panics at first use.
-
-### Removed
 
 ### Fixed
 
