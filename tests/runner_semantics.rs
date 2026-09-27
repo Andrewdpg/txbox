@@ -326,3 +326,14 @@ async fn a_backend_returning_too_few_claims_is_an_error() {
         "got {result:?}"
     );
 }
+
+#[test]
+fn claim_batch_builds_a_lock_timeout_like_claim_request() {
+    let consumer = ConsumerId::try_from("billing").unwrap();
+    let id = MessageId::try_from("m-1").unwrap();
+    let ids = [&id];
+
+    let batch = ClaimBatch::new(&consumer, &ids).with_lock_timeout(Duration::from_millis(200));
+
+    assert_eq!(batch.lock_timeout, Some(Duration::from_millis(200)));
+}

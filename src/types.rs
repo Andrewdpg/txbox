@@ -169,6 +169,12 @@ impl<'a> ClaimBatch<'a> {
             lock_timeout: None,
         }
     }
+
+    /// Sets the lock timeout.
+    pub fn with_lock_timeout(mut self, lock_timeout: Duration) -> Self {
+        self.lock_timeout = Some(lock_timeout);
+        self
+    }
 }
 
 /// The result of running a handler through the inbox.

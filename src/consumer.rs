@@ -96,14 +96,22 @@ impl<S: Savepoints> Consumer<S> {
                 }
                 for (id, claim) in ids.iter().zip(claims) {
                     if claim == Claim::Duplicate {
-                        results.push(if failed.contains(id.as_str()) {
-                            Err(
-                                format!("an earlier delivery of `{id}` in this batch failed")
-                                    .into(),
+                        if failed.contains(id.as_str()) {
+                            results.push(Err(format!(
+                                "an earlier delivery of `{id}` in this batch failed"
                             )
+                            .into()));
                         } else {
-                            Ok(Outcome::Duplicate)
-                        });
+                            // Same target as `process`, so duplicate volume is
+                            // watched in one place.
+                            tracing::debug!(
+                                target: "txbox::duplicate",
+                                consumer = %self.id,
+                                message_id = %id,
+                                "duplicate message skipped"
+                            );
+                            results.push(Ok(Outcome::Duplicate));
+                        }
                         continue;
                     }
                     pending -= 1;

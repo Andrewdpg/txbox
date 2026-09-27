@@ -17,7 +17,8 @@ This project is pre-1.0: breaking changes may land in any minor release.
 - `testing` feature with `txbox::testing::conformance`, a suite backend
   authors run against their own `InboxStore`.
 - `Consumer::claim_many` and `InboxStore::claim_many` (default: one claim
-  per id; one statement on PostgreSQL and SQLite).
+  per id; one statement on PostgreSQL and SQLite, two on MySQL), with
+  `ClaimBatch` and its `with_lock_timeout` builder.
 - `Consumer::process_many` over the new `Savepoints` trait (PostgreSQL,
   SQLite): per-message savepoints, so a failing handler costs only its
   own message. Its per-message result is `ProcessResult<T>`.

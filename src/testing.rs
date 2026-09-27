@@ -283,6 +283,12 @@ pub async fn savepoints_conformance<S: Savepoints + Clone + 'static>(store: S) {
         .map(|id| message(&id))
         .collect();
     let poisons = ["m0", "m5", "m9"];
+    // Processed before the batch: its handler must not run again.
+    let known = "m7";
+    assert_eq!(
+        claim_and_commit(&store, &inbox, &message(known)).await,
+        Claim::Fresh
+    );
 
     let (effect_store, effect_consumer) = (store.clone(), effects.clone());
     let results = store
@@ -305,6 +311,17 @@ pub async fn savepoints_conformance<S: Savepoints + Clone + 'static>(store: S) {
         .expect("process_many");
 
     for (id, result) in ids.iter().zip(&results) {
+        if id.as_str() == known {
+            assert!(
+                matches!(result, Ok(Outcome::Duplicate)),
+                "{id} was processed before the batch and must be a duplicate, got {result:?}"
+            );
+            assert!(
+                !is_committed(&store, &effects, id).await,
+                "{id}: the handler must not run for an already-processed message"
+            );
+            continue;
+        }
         let poisoned = poisons.contains(&id.as_str());
         assert_eq!(
             result.is_err(),

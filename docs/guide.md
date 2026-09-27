@@ -80,7 +80,8 @@ deadlock has already rolled it back, and later statements on it commit one
 by one.
 
 `claim_many` claims the whole batch in one statement (PostgreSQL `unnest`,
-SQLite `json_each`) and answers per id, in input order. Measured on
+SQLite `json_each`; MySQL has no `RETURNING`, so it takes two, a
+`JSON_TABLE` insert and a read-back) and answers per id, in input order. Measured on
 PostgreSQL 17 with 10,000 ids: about 91ms, against about 1s for a loop of
 `claim`. A repeated id gets `Duplicate` after its first occurrence. Row
 locks are taken in byte order, so overlapping batches from concurrent
