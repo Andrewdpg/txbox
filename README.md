@@ -79,7 +79,7 @@ txbox = { version = "0.2", default-features = false, features = ["sqlite"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-smol"] }
 ```
 
-MySQL needs 8.0.4 or later. Over a plaintext connection, MySQL 8's default
+MySQL needs 8.0.17 or later. Over a plaintext connection, MySQL 8's default
 password authentication needs sqlx's `mysql-rsa` feature; txbox doesn't
 turn it on for you. Use TLS, or add `sqlx = { version = "0.9", features = ["mysql-rsa"] }`.
 
@@ -133,9 +133,10 @@ Same shape, with `processed_at TEXT`. Also exposed as `sqlite::MIGRATION_SQL`.
 ### MySQL
 
 Same shape, with `VARCHAR` ids, `processed_at DATETIME(6)` and a
-`claim_token` column used by `claim_many`. The table is `utf8mb4_bin`: MySQL's
-default collation ignores case and accents, which would merge distinct
-message ids. Also exposed as `mysql::MIGRATION_SQL`.
+`claim_token` column used by `claim_many`. The table is `utf8mb4_0900_bin`,
+which compares ids byte for byte: MySQL's default collation ignores case and
+accents, and the older `utf8mb4_bin` pads with spaces, both of which would
+merge distinct message ids. Also exposed as `mysql::MIGRATION_SQL`.
 
 Running a per-tenant schema? See [`docs/guide.md`](docs/guide.md#multi-tenant-schemas).
 

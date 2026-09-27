@@ -1,8 +1,9 @@
 //! MySQL implementation of [`InboxStore`].
 //!
-//! Needs MySQL 8.0.4+ (`JSON_TABLE`). The table uses `utf8mb4_bin` because
-//! MySQL's default collation compares case- and accent-insensitively, which
-//! would merge distinct message ids.
+//! Needs MySQL 8.0.17+ (`utf8mb4_0900_bin`). The table compares ids byte for
+//! byte: MySQL's default collation ignores case and accents, and the older
+//! `utf8mb4_bin` pads with spaces (`'a' = 'a '`), both of which would merge
+//! distinct message ids.
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -60,12 +61,12 @@ const CLAIM_SQL: &str = "INSERT IGNORE INTO inbox_messages (consumer_id, message
 // the second. `ORDER BY` pins the lock order, as on PostgreSQL.
 const CLAIM_MANY_SQL: &str = "INSERT INTO inbox_messages (consumer_id, message_id, processed_at, claim_token) \
      SELECT ?, j.id, UTC_TIMESTAMP(6), ? \
-     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) AS j \
+     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin PATH '$')) AS j \
      ORDER BY j.id \
      ON DUPLICATE KEY UPDATE consumer_id = inbox_messages.consumer_id";
 
 const CLAIMED_BY_TOKEN_SQL: &str = "SELECT m.message_id \
-     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin PATH '$')) AS j \
+     FROM JSON_TABLE(?, '$[*]' COLUMNS (id VARCHAR(512) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin PATH '$')) AS j \
      JOIN inbox_messages m ON m.consumer_id = ? AND m.message_id = j.id \
      WHERE m.claim_token = ?";
 

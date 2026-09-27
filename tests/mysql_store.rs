@@ -356,3 +356,20 @@ async fn begin_restores_a_lock_timeout_left_by_a_cancelled_claim() {
 
     assert_eq!(session_lock_timeout(&inbox).await, 7);
 }
+
+/// `utf8mb4_bin` is PAD SPACE, so `'a'` and `'a '` would be one key. Ids
+/// reject trailing whitespace today; the table must not depend on that.
+#[tokio::test]
+async fn the_table_does_not_pad_ids_with_spaces() {
+    let (_container, inbox) = inbox(1).await;
+    for id in ["a", "a "] {
+        sqlx::query(
+            "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \
+             VALUES ('c', ?, UTC_TIMESTAMP(6))",
+        )
+        .bind(id)
+        .execute(inbox.pool())
+        .await
+        .unwrap_or_else(|e| panic!("inserting {id:?}: {e}"));
+    }
+}
