@@ -1,39 +1,21 @@
 #![cfg(feature = "mysql")]
 
+use crate::common::{mysql, mysql_url, shuffled};
+
 use std::time::Duration;
 
 use sqlx::mysql::MySqlPoolOptions;
 use testcontainers_modules::mysql::Mysql as MysqlImage;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use txbox::mysql::MySqlInbox;
 use txbox::{Claim, ClaimRequest, ConsumerId, InboxExt, InboxStore, MessageId, RetentionPolicy};
-
-/// The container handle must stay alive for as long as the pool is used.
-async fn inbox(max_connections: u32) -> (ContainerAsync<MysqlImage>, MySqlInbox) {
-    let container = MysqlImage::default()
-        .with_tag("8.4")
-        .start()
-        .await
-        .expect("start mysql");
-    let port = container.get_host_port_ipv4(3306).await.expect("map port");
-    let pool = MySqlPoolOptions::new()
-        .max_connections(max_connections)
-        .connect(&format!("mysql://root@127.0.0.1:{port}/test"))
-        .await
-        .expect("connect to mysql");
-    let inbox = MySqlInbox::new(pool);
-    inbox.migrate().await.expect("run migrations");
-    (container, inbox)
-}
 
 /// sqlx always sets CLIENT_FOUND_ROWS, under which a no-op
 /// `ON DUPLICATE KEY UPDATE` reports one affected row for a duplicate too.
 /// A duplicate must still read as a duplicate.
 #[tokio::test]
 async fn claim_is_fresh_once_then_duplicate() {
-    let (_container, inbox) = inbox(2).await;
+    let (_container, inbox) = mysql(2).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -51,7 +33,7 @@ async fn claim_is_fresh_once_then_duplicate() {
 
 #[tokio::test]
 async fn purge_deletes_only_entries_outside_the_window() {
-    let (_container, inbox) = inbox(2).await;
+    let (_container, inbox) = mysql(2).await;
     let consumer = inbox.consumer(ConsumerId::try_from("billing").unwrap());
     for id in ["old", "new"] {
         let mut tx = consumer.begin().await.unwrap();
@@ -83,7 +65,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
 
 #[tokio::test]
 async fn claim_many_twice_in_one_transaction_sees_its_own_claims() {
-    let (_container, inbox) = inbox(2).await;
+    let (_container, inbox) = mysql(2).await;
     let consumer = inbox.consumer(ConsumerId::try_from("twice").unwrap());
     let ids: Vec<MessageId> = (0..10_000)
         .map(|i| MessageId::try_from(format!("m{i}")).unwrap())
@@ -99,24 +81,9 @@ async fn claim_many_twice_in_one_transaction_sees_its_own_claims() {
     assert!(second[5_000..].iter().all(|c| *c == Claim::Fresh));
 }
 
-fn shuffled(n: usize, seed: u64) -> Vec<MessageId> {
-    let mut v: Vec<MessageId> = (0..n)
-        .map(|i| MessageId::try_from(format!("m{i:05}")).unwrap())
-        .collect();
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    for i in (1..v.len()).rev() {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        v.swap(i, (s >> 33) as usize % (i + 1));
-    }
-    v
-}
-
-/// Measured before the fix: 87 of 120 such transactions deadlocked.
 #[tokio::test]
 async fn crossed_claim_many_batches_never_deadlock() {
-    let (_container, inbox) = inbox(8).await;
+    let (_container, inbox) = mysql(8).await;
     let consumer = ConsumerId::try_from("crossed").unwrap();
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(4));
 
@@ -144,7 +111,7 @@ async fn crossed_claim_many_batches_never_deadlock() {
 
 #[tokio::test]
 async fn a_lock_timeout_returns_contended_and_does_not_leak_to_the_next_transaction() {
-    let (_container, inbox) = inbox(2).await;
+    let (_container, inbox) = mysql(2).await;
     let consumer_id = ConsumerId::try_from("contended").unwrap();
     let id = MessageId::try_from("m").unwrap();
 
@@ -184,7 +151,7 @@ async fn a_lock_timeout_returns_contended_and_does_not_leak_to_the_next_transact
 
 #[tokio::test]
 async fn a_deadlock_victim_gets_contended() {
-    let (_container, inbox) = inbox(2).await;
+    let (_container, inbox) = mysql(2).await;
     let consumer = inbox.consumer(ConsumerId::try_from("deadlock").unwrap());
     let (a, b) = (
         MessageId::try_from("a").unwrap(),
@@ -218,13 +185,7 @@ async fn a_deadlock_victim_gets_contended() {
 async fn one_connection_inbox(
     after_connect_timeout: Option<u64>,
 ) -> (ContainerAsync<MysqlImage>, MySqlInbox, String) {
-    let container = MysqlImage::default()
-        .with_tag("8.4")
-        .start()
-        .await
-        .expect("start mysql");
-    let port = container.get_host_port_ipv4(3306).await.expect("map port");
-    let url = format!("mysql://root@127.0.0.1:{port}/test");
+    let (container, url) = mysql_url().await;
     let pool = MySqlPoolOptions::new()
         .max_connections(1)
         .after_connect(move |conn, _| {
@@ -361,7 +322,7 @@ async fn begin_restores_a_lock_timeout_left_by_a_cancelled_claim() {
 /// reject trailing whitespace today; the table must not depend on that.
 #[tokio::test]
 async fn the_table_does_not_pad_ids_with_spaces() {
-    let (_container, inbox) = inbox(1).await;
+    let (_container, inbox) = mysql(1).await;
     for id in ["a", "a "] {
         sqlx::query(
             "INSERT INTO inbox_messages (consumer_id, message_id, processed_at) \

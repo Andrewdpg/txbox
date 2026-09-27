@@ -1,5 +1,7 @@
 #![cfg(feature = "sqlite")]
 
+use crate::common::sqlite;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,23 +12,9 @@ use txbox::{
     RetentionPolicy,
 };
 
-async fn inbox() -> SqliteInbox {
-    // max_connections(1) keeps every operation on the same in-memory database;
-    // each new SQLite memory connection would otherwise get its own empty one.
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .expect("connect to in-memory sqlite");
-
-    let inbox = SqliteInbox::new(pool);
-    inbox.migrate().await.expect("run migrations");
-    inbox
-}
-
 #[tokio::test]
 async fn claim_is_fresh_once_then_duplicate() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -53,7 +41,7 @@ async fn claim_is_fresh_once_then_duplicate() {
 
 #[tokio::test]
 async fn a_rolled_back_claim_leaves_no_trace() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -80,7 +68,7 @@ async fn a_rolled_back_claim_leaves_no_trace() {
 
 #[tokio::test]
 async fn a_failing_handler_lets_the_retry_succeed() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -102,7 +90,7 @@ async fn a_failing_handler_lets_the_retry_succeed() {
 
 #[tokio::test]
 async fn purge_deletes_only_entries_outside_the_window() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
@@ -144,7 +132,7 @@ async fn purge_deletes_only_entries_outside_the_window() {
 
 #[tokio::test]
 async fn purge_batches_across_multiple_passes() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
 
     for message in ["m-1", "m-2", "m-3"] {
@@ -244,7 +232,7 @@ async fn on_sqlite_the_loser_of_a_claim_race_gets_contended() {
 
 #[tokio::test]
 async fn claim_many_round_trips_awkward_ids() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = inbox.consumer(ConsumerId::try_from("odd").unwrap());
     let raw = [
         "q\"uote",
@@ -278,7 +266,7 @@ async fn claim_many_round_trips_awkward_ids() {
 
 #[tokio::test]
 async fn process_many_runs_the_handler_once_per_distinct_id() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = inbox.consumer(ConsumerId::try_from("many").unwrap());
     let ids: Vec<MessageId> = ["a", "b", "a"]
         .iter()
@@ -309,7 +297,7 @@ async fn process_many_runs_the_handler_once_per_distinct_id() {
 /// message that was never processed.
 #[tokio::test]
 async fn process_many_reports_a_repeat_of_a_failed_id_as_failed() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer_id = ConsumerId::try_from("repeat-poison").unwrap();
     let consumer = inbox.consumer(consumer_id.clone());
     let ids: Vec<MessageId> = ["a", "a"]
@@ -336,7 +324,7 @@ async fn process_many_reports_a_repeat_of_a_failed_id_as_failed() {
 
 #[tokio::test]
 async fn a_committed_claim_is_a_known_duplicate() {
-    let inbox = inbox().await;
+    let inbox = sqlite().await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
     assert!(!inbox.is_known_duplicate(&consumer, &id).await.unwrap());

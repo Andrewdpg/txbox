@@ -1,10 +1,10 @@
 #![cfg(feature = "sqlite")]
 
+use crate::common::sqlite;
+
 use std::sync::{Arc, Mutex};
 
-use sqlx::sqlite::SqlitePoolOptions;
 use tracing::Level;
-use txbox::sqlite::SqliteInbox;
 use txbox::{ConsumerId, InboxExt, MessageId};
 
 /// Records the target and level of every event emitted while it is installed.
@@ -39,13 +39,7 @@ impl tracing::subscriber::Subscriber for LevelSpy {
 
 #[tokio::test]
 async fn duplicates_are_logged_at_debug_never_warn() {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let inbox = SqliteInbox::new(pool);
-    inbox.migrate().await.unwrap();
+    let inbox = sqlite().await;
 
     let spy = LevelSpy::default();
     let consumer = ConsumerId::try_from("billing").unwrap();
@@ -75,8 +69,7 @@ async fn duplicates_are_logged_at_debug_never_warn() {
 
     let levels = recorded.lock().unwrap();
     assert!(!levels.is_empty(), "the duplicate path must emit an event");
-    // tracing orders levels by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-    // `>= DEBUG` therefore admits only DEBUG and TRACE, and rejects WARN.
+    // Levels order ERROR < WARN < INFO < DEBUG < TRACE, so `>= DEBUG` rejects WARN.
     assert!(
         levels.iter().all(|(_, l)| *l >= Level::DEBUG),
         "duplicates are normal under at-least-once delivery and must never be warnings"
@@ -87,13 +80,7 @@ async fn duplicates_are_logged_at_debug_never_warn() {
 /// (`RUST_LOG=txbox::duplicate=debug`); `process_many` must feed it too.
 #[tokio::test]
 async fn process_many_logs_duplicates_under_the_duplicate_target() {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let inbox = SqliteInbox::new(pool);
-    inbox.migrate().await.unwrap();
+    let inbox = sqlite().await;
     let consumer = inbox.consumer(ConsumerId::try_from("billing").unwrap());
     let ids = [MessageId::try_from("m-1").unwrap()];
 

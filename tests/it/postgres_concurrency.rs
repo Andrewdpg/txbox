@@ -1,37 +1,19 @@
 #![cfg(feature = "postgres")]
 
+use crate::common::{postgres, shuffled};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sqlx::PgPool;
-use sqlx::postgres::PgPoolOptions;
 use testcontainers_modules::postgres::Postgres as PostgresImage;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use txbox::postgres::PgInbox;
 use txbox::{ConsumerId, InboxError, InboxExt, MessageId, Outcome};
 
-/// The container handle must stay alive for as long as the pool is used;
-/// dropping it stops the database.
 async fn inbox() -> (ContainerAsync<PostgresImage>, PgPool, Arc<PgInbox>) {
-    let container = PostgresImage::default()
-        .with_tag("15-alpine")
-        .start()
-        .await
-        .expect("start postgres");
-    let port = container.get_host_port_ipv4(5432).await.expect("map port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect to postgres");
-
-    let inbox = Arc::new(PgInbox::new(pool.clone()));
-    inbox.migrate().await.expect("run migrations");
-    (container, pool, inbox)
+    let (container, inbox) = postgres(8).await;
+    (container, inbox.pool().clone(), Arc::new(inbox))
 }
 
 /// Two consumers race on the same message, exactly as they would during a
@@ -108,10 +90,6 @@ async fn concurrent_delivery_applies_the_effect_exactly_once() {
 /// is a consequence of how `INSERT ... ON CONFLICT DO NOTHING` treats an
 /// uncommitted conflicting row, and it means the loser's latency is bounded by
 /// the winner's *handler*, not by the database.
-///
-/// Nothing verified that claim until now. It is pinned here because the cost it
-/// describes is exactly what any future optimisation of the duplicate path
-/// would change.
 #[tokio::test]
 async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
     const HANDLER: Duration = Duration::from_millis(1500);
@@ -169,14 +147,6 @@ async fn the_loser_of_a_claim_race_waits_for_the_winner_to_finish() {
          it did not block on the winner's transaction"
     );
 }
-
-// A test previously lived here asserting that the (now-removed) duplicate
-// fast path still applied the effect exactly once under a race. `process`
-// no longer has a fast path to race against — it always takes claim's
-// transactional path — so that scenario no longer exists. The property it
-// was guarding (`claim` arbitrates a race correctly) is already covered by
-// `concurrent_delivery_applies_the_effect_exactly_once` above, which doesn't
-// depend on the removed toggle at all.
 
 /// `with_lock_timeout` exists to turn the blocking wait proven above into a
 /// fast, explicit error. Consumer A claims the row and holds its transaction
@@ -324,24 +294,8 @@ async fn a_zero_lock_timeout_fails_fast_instead_of_disabling_the_timeout() {
         .expect("no inbox error");
 }
 
-fn shuffled(n: usize, seed: u64) -> Vec<MessageId> {
-    let mut v: Vec<MessageId> = (0..n)
-        .map(|i| MessageId::try_from(format!("m{i:05}")).unwrap())
-        .collect();
-    let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    for i in (1..v.len()).rev() {
-        s = s
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        v.swap(i, (s >> 33) as usize % (i + 1));
-    }
-    v
-}
-
 /// Four consumers claim the same 2000 ids at once, each in a different
-/// random order, and hold their transactions open briefly. Measured before
-/// the fix: unsorted, 90 of 120 such transactions died with 40P01. Sorting
-/// the lock order in SQL makes a cycle impossible.
+/// random order. Sorting the lock order in SQL makes a deadlock impossible.
 #[tokio::test]
 async fn crossed_claim_many_batches_never_deadlock() {
     let (_container, _pool, inbox) = inbox().await;
