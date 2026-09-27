@@ -53,8 +53,9 @@ async fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
 let mut tx = orders.begin().await?;
 
-for id in batch {
-    if orders.claim(&mut tx, id).await? == Claim::Fresh {
+let claims = orders.claim_many(&mut tx, batch).await?;
+for (id, claim) in batch.iter().zip(claims) {
+    if claim == Claim::Fresh {
         sqlx::query("INSERT INTO orders (message_id) VALUES ($1)")
             .bind(id.as_str())
             .execute(&mut *tx)
@@ -66,18 +67,47 @@ orders.commit(tx).await?;
 Ok(()) }
 ```
 
-A repeated id inside one batch is caught for free — a claim is visible to
-later statements in its own transaction, so the second occurrence sees the
-first and reports `Duplicate`.
-
 The batch is one unit of failure: if anything in it fails, the whole
 transaction rolls back and every message in it becomes unclaimed again, so
 the broker redelivers the whole batch. The transaction is also held open for
 the whole batch, so a concurrent consumer racing for any id in it blocks for
 that entire span. Commit the broker's offsets only after `commit` returns.
 
-To abandon a batch, drop the transaction — `InboxStore` has no explicit
-rollback, so generic code relies on the drop.
+If a claim returns `InboxError::Contended`, roll the transaction back and
+retry the whole batch in a new one. Don't keep using it: on MySQL a
+deadlock has already rolled it back, and later statements on it commit one
+by one. To abandon a batch, call `orders.rollback(tx)`.
+
+`claim_many` claims the whole batch in one statement (PostgreSQL `unnest`,
+SQLite `json_each`; MySQL has no `RETURNING`, so it takes two, a
+`JSON_TABLE` insert and a read-back) and answers per id, in input order. A
+repeated id gets `Duplicate` after its first occurrence. Row locks are taken
+in byte order, so overlapping batches from concurrent consumers don't
+deadlock, and held until commit, so a bigger batch keeps competing consumers
+waiting longer ([numbers](operations.md#batches)).
+
+When the effect can be written in bulk too, keep it to two statements:
+
+```rust,ignore
+let mut tx = orders.begin().await?;
+let claims = orders.claim_many(&mut tx, batch).await?;
+let fresh: Vec<&str> = batch
+    .iter()
+    .zip(&claims)
+    .filter(|(_, c)| **c == Claim::Fresh)
+    .map(|(id, _)| id.as_str())
+    .collect();
+sqlx::query("INSERT INTO orders (message_id) SELECT unnest($1::text[])")
+    .bind(&fresh)
+    .execute(&mut *tx)
+    .await?;
+orders.commit(tx).await?;
+```
+
+That whole batch still fails as one unit. `process_many` runs a handler
+per message inside a savepoint instead: a failing handler rolls back only
+its own effects and claim, and you get one result per message to ack or
+nack. It needs a backend implementing `Savepoints`.
 
 ## Multi-tenant schemas
 
@@ -156,3 +186,36 @@ Ok(()) }
 `txbox` doesn't store this for you — the shape of that decision (an enum, a
 result payload, a version number) is yours to pick, and a generic library
 shouldn't guess it.
+
+## Writing a backend
+
+Implement `InboxStore` and run the conformance suite from your tests with
+the `testing` feature:
+
+```rust,ignore
+#[tokio::test]
+async fn my_backend_conforms() {
+    // A pool of exactly one connection, so a transaction leaked back to the
+    // pool is caught.
+    txbox::testing::conformance(MyInbox::new(one_connection_pool().await)).await;
+}
+```
+
+It checks that duplicates are detected, that a failed handler and a
+dropped transaction roll back, and that ids of maximum length that differ
+only in their last byte, in case or in accents stay distinct. The last two
+catch the usual schema mistakes: a narrow column, or a default collation
+that ignores case (MySQL's `utf8mb4_0900_ai_ci`, SQL Server's
+`SQL_Latin1_General_CP1_CI_AS`).
+
+If your driver's transaction borrows its connection (tokio-postgres's
+`Transaction<'_>`), own the pooled connection instead, issue `BEGIN` and
+`COMMIT` yourself, and roll back in `Drop` by moving the connection into a
+spawned task. Returning it to the pool with the transaction open lets the
+next caller commit it.
+
+## Writing a handler
+
+Pass the handler inline or as a `fn`. A closure stored in a `let` first
+loses the higher-ranked lifetime `process` needs, and the error ("one type
+is more general than the other") doesn't say why.

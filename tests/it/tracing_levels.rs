@@ -1,15 +1,15 @@
 #![cfg(feature = "sqlite")]
 
+use crate::common::sqlite;
+
 use std::sync::{Arc, Mutex};
 
-use sqlx::sqlite::SqlitePoolOptions;
 use tracing::Level;
-use txbox::sqlite::SqliteInbox;
 use txbox::{ConsumerId, InboxExt, MessageId};
 
-/// Records the level of every event emitted while it is installed.
+/// Records the target and level of every event emitted while it is installed.
 #[derive(Clone, Default)]
-struct LevelSpy(Arc<Mutex<Vec<Level>>>);
+struct LevelSpy(Arc<Mutex<Vec<(String, Level)>>>);
 
 impl tracing::subscriber::Subscriber for LevelSpy {
     fn enabled(&self, _m: &tracing::Metadata<'_>) -> bool {
@@ -27,7 +27,10 @@ impl tracing::subscriber::Subscriber for LevelSpy {
         // that threshold on an in-memory insert would fail this test by
         // blaming txbox for something sqlx did.
         if event.metadata().target().starts_with("txbox") {
-            self.0.lock().unwrap().push(*event.metadata().level());
+            self.0.lock().unwrap().push((
+                event.metadata().target().to_owned(),
+                *event.metadata().level(),
+            ));
         }
     }
     fn enter(&self, _s: &tracing::Id) {}
@@ -36,13 +39,7 @@ impl tracing::subscriber::Subscriber for LevelSpy {
 
 #[tokio::test]
 async fn duplicates_are_logged_at_debug_never_warn() {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    let inbox = SqliteInbox::new(pool);
-    inbox.migrate().await.unwrap();
+    let inbox = sqlite().await;
 
     let spy = LevelSpy::default();
     let consumer = ConsumerId::try_from("billing").unwrap();
@@ -72,10 +69,42 @@ async fn duplicates_are_logged_at_debug_never_warn() {
 
     let levels = recorded.lock().unwrap();
     assert!(!levels.is_empty(), "the duplicate path must emit an event");
-    // tracing orders levels by verbosity: ERROR < WARN < INFO < DEBUG < TRACE.
-    // `>= DEBUG` therefore admits only DEBUG and TRACE, and rejects WARN.
+    // Levels order ERROR < WARN < INFO < DEBUG < TRACE, so `>= DEBUG` rejects WARN.
     assert!(
-        levels.iter().all(|l| *l >= Level::DEBUG),
+        levels.iter().all(|(_, l)| *l >= Level::DEBUG),
         "duplicates are normal under at-least-once delivery and must never be warnings"
+    );
+}
+
+/// Duplicate volume is watched through the `txbox::duplicate` target
+/// (`RUST_LOG=txbox::duplicate=debug`); `process_many` must feed it too.
+#[tokio::test]
+async fn process_many_logs_duplicates_under_the_duplicate_target() {
+    let inbox = sqlite().await;
+    let consumer = inbox.consumer(ConsumerId::try_from("billing").unwrap());
+    let ids = [MessageId::try_from("m-1").unwrap()];
+
+    consumer
+        .process_many(&ids, |_c, _id| Box::pin(async { Ok(()) }))
+        .await
+        .unwrap();
+
+    let spy = LevelSpy::default();
+    let recorded = spy.0.clone();
+    {
+        // Thread-local, like the test above: relies on the current-thread runtime.
+        let _guard = tracing::subscriber::set_default(spy);
+        consumer
+            .process_many(&ids, |_c, _id| Box::pin(async { Ok(()) }))
+            .await
+            .unwrap();
+    }
+
+    let events = recorded.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|(target, level)| target == "txbox::duplicate" && *level == Level::DEBUG),
+        "process_many must log duplicates under txbox::duplicate at DEBUG, got {events:?}"
     );
 }

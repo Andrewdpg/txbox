@@ -46,12 +46,17 @@ pub enum InboxError {
     #[error("inbox handler failure: {0}")]
     Handler(#[source] HandlerError),
 
-    /// [`Consumer::claim`](crate::Consumer::claim) could not acquire the row
-    /// within [`with_lock_timeout`](crate::Consumer::with_lock_timeout).
+    /// A claim lost to another consumer holding the same row: the lock
+    /// timeout ([`with_lock_timeout`](crate::Consumer::with_lock_timeout))
+    /// expired, the database chose this transaction as a deadlock victim, or
+    /// (SQLite) another connection held the write lock.
     ///
-    /// This means another consumer is claiming this message right now, not
-    /// that the backend has failed — retry it, don't dead-letter it.
-    #[error("inbox claim contended: lock timeout exceeded")]
+    /// Not a backend failure: retry the message, don't dead-letter it. Retry
+    /// the whole unit in a new transaction, though. The current one is done:
+    /// PostgreSQL has aborted it, and on MySQL a deadlock has already rolled it
+    /// back, so anything run on it afterwards commits statement by statement.
+    /// Roll it back or drop it first.
+    #[error("inbox claim contended: another consumer holds the row")]
     Contended,
 
     /// An identifier failed validation. Permanent — retrying redelivers the
@@ -60,6 +65,7 @@ pub enum InboxError {
     InvalidId(#[source] InvalidId),
 }
 
+#[cfg(any(feature = "postgres", feature = "sqlite", feature = "mysql"))]
 impl From<sqlx::Error> for InboxError {
     fn from(value: sqlx::Error) -> Self {
         InboxError::Backend(Box::new(value))

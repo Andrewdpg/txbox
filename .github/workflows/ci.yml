@@ -28,7 +28,17 @@ jobs:
       # dependent sees before choosing one. It has to stand on its own.
       - run: cargo clippy --all-targets -- -D warnings
 
-      - run: cargo clippy --all-targets --features postgres,sqlite -- -D warnings
+      - run: cargo clippy --all-targets --features postgres,sqlite,mysql,testing -- -D warnings
+
+      # sqlx is optional. A crate that only implements `InboxStore` selects no
+      # backend and must not compile sqlx at all.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: "! cargo tree -e normal --no-default-features | grep -q 'sqlx v'"
+
+      # Opting out of the default runtime must actually drop tokio, and txbox
+      # itself must not assume it.
+      - run: cargo check --no-default-features --features sqlite,sqlx/runtime-smol
+      - run: "! cargo tree -e normal --no-default-features --features sqlite,sqlx/runtime-smol | grep -q 'tokio v'"
 
       # The example lives behind its own feature, so neither the test run nor
       # the lint above ever builds it. It is code people copy; it should not be
@@ -37,9 +47,18 @@ jobs:
 
       # The README is included as crate documentation, so a link that breaks in
       # it fails here rather than silently on docs.rs.
-      - run: cargo doc --no-deps --features postgres,sqlite
+      - run: cargo doc --no-deps --features postgres,sqlite,mysql,testing
         env:
           RUSTDOCFLAGS: -D warnings
+
+  # Known vulnerabilities in the locked dependency tree fail the build.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo install cargo-audit --locked
+      - run: cargo audit
 
   test:
     runs-on: ubuntu-latest
@@ -50,11 +69,11 @@ jobs:
         # Each backend is exercised alone, not only in combination. Modules
         # behind separate features can compile together and still fail
         # individually, and a dependent enables exactly one.
-        features: [postgres, sqlite]
+        features: [postgres, sqlite, mysql]
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       # The PostgreSQL suites start their own database through testcontainers;
       # ubuntu-latest already runs a Docker daemon, so nothing to set up here.
-      - run: cargo test --features ${{ matrix.features }}
+      - run: cargo test --features ${{ matrix.features }},testing

@@ -5,7 +5,7 @@ use std::pin::Pin;
 use crate::consumer::Consumer;
 use crate::error::InboxError;
 use crate::retention::RetentionPolicy;
-use crate::types::{Claim, ClaimRequest, ConsumerId, MessageId};
+use crate::types::{Claim, ClaimBatch, ClaimRequest, ConsumerId, MessageId};
 
 /// A boxed, `Send` future.
 ///
@@ -18,8 +18,13 @@ pub trait InboxStore: Send + Sync {
     /// The backend's connection type, as handed to message handlers.
     type Conn: Send;
 
-    /// The backend's transaction type. Dropping it without committing must
-    /// roll back.
+    /// The backend's transaction type.
+    ///
+    /// Dropping it without committing must roll back, including when a
+    /// future holding it is cancelled: a pooled connection must never go
+    /// back to the pool with a transaction open, or the next caller's commit
+    /// commits it too. `txbox::testing::conformance` (the `testing`
+    /// feature) checks this.
     type Tx: DerefMut<Target = Self::Conn> + Send;
 
     /// Opens a new transaction.
@@ -28,6 +33,16 @@ pub trait InboxStore: Send + Sync {
     /// Commits a transaction.
     fn commit(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>>;
 
+    /// Rolls back a transaction.
+    ///
+    /// The default drops `tx`, relying on the rollback-on-drop contract
+    /// above. Override it when the driver can roll back explicitly, so the
+    /// common error path doesn't depend on `Drop`.
+    fn rollback(&self, tx: Self::Tx) -> BoxFuture<'_, Result<(), InboxError>> {
+        drop(tx);
+        Box::pin(async { Ok(()) })
+    }
+
     /// Records `id` for `consumer` on `conn`, reporting whether it was new.
     ///
     /// Must be a single atomic statement — a read followed by a conditional
@@ -35,15 +50,44 @@ pub trait InboxStore: Send + Sync {
     /// `conn`, the same connection the handler uses for its own effects, or
     /// the all-or-nothing guarantee is lost.
     ///
+    /// Ids compare byte for byte: a case- or accent-insensitive collation, or
+    /// a column narrower than [`ConsumerId::MAX_LEN`] / [`MessageId::MAX_LEN`]
+    /// bytes, makes distinct messages collide and silently skips one.
+    ///
     /// `request.lock_timeout`, when set, bounds how long this call waits for
     /// a row contended by another consumer before returning
-    /// [`InboxError::Contended`] instead of blocking. Backends with no way to
-    /// bound the wait (SQLite) ignore it.
+    /// [`InboxError::Contended`] instead of blocking. Backends implementing
+    /// [`LockTimeout`] must honor it; others never receive `Some` from
+    /// [`Consumer`].
     fn claim<'a>(
         &'a self,
         conn: &'a mut Self::Conn,
         request: ClaimRequest<'a>,
     ) -> BoxFuture<'a, Result<Claim, InboxError>>;
+
+    /// Records every id in `batch` for its consumer on `conn`, reporting for
+    /// each, in order, whether it was new.
+    ///
+    /// `batch.ids` arrive unique and sorted by bytes; take row locks in that
+    /// order. Must return exactly one [`Claim`] per id. The default claims
+    /// them one by one; override it to do the batch in one statement.
+    fn claim_many<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        batch: ClaimBatch<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Claim>, InboxError>> {
+        Box::pin(async move {
+            let mut claims = Vec::with_capacity(batch.ids.len());
+            for id in batch.ids {
+                let request = ClaimRequest {
+                    lock_timeout: batch.lock_timeout,
+                    ..ClaimRequest::new(batch.consumer, id)
+                };
+                claims.push(self.claim(conn, request).await?);
+            }
+            Ok(claims)
+        })
+    }
 
     /// Reports whether `(consumer, id)` is already recorded, without opening a
     /// transaction.
@@ -66,6 +110,50 @@ pub trait InboxStore: Send + Sync {
 
     /// Deletes entries older than the policy's window. Returns rows removed.
     fn purge<'a>(&'a self, policy: &'a RetentionPolicy) -> BoxFuture<'a, Result<u64, InboxError>>;
+}
+
+/// A backend that honors [`ClaimRequest::lock_timeout`]: a claim waiting on
+/// a contended row gives up with [`InboxError::Contended`] once it expires.
+/// May round up to the backend's granularity, never down to zero.
+///
+/// Only consumers over a `LockTimeout` backend have
+/// [`with_lock_timeout`](crate::Consumer::with_lock_timeout), so asking for
+/// a timeout a backend can't enforce is a compile error rather than a
+/// silent no-op.
+pub trait LockTimeout: InboxStore {}
+
+/// A backend that supports savepoints, which is what lets
+/// [`process_many`](crate::Consumer::process_many) roll back one message's
+/// handler without losing the rest of the batch.
+///
+/// All methods act on one savepoint name owned by txbox. Only consumers over
+/// a `Savepoints` backend have `process_many`; elsewhere, loop over
+/// [`process`](crate::Consumer::process), which has the same semantics.
+pub trait Savepoints: InboxStore {
+    /// Opens the savepoint.
+    fn savepoint<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Releases the savepoint and opens it again, in one round-trip.
+    fn release_and_savepoint<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+    ) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Releases the savepoint.
+    fn release<'a>(&'a self, conn: &'a mut Self::Conn) -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Rolls back to the savepoint, which stays open.
+    fn rollback_to<'a>(&'a self, conn: &'a mut Self::Conn)
+    -> BoxFuture<'a, Result<(), InboxError>>;
+
+    /// Deletes the claim of `id` for `consumer` on `conn`, so a message whose
+    /// handler failed stays unclaimed and is redelivered.
+    fn unclaim<'a>(
+        &'a self,
+        conn: &'a mut Self::Conn,
+        consumer: &'a ConsumerId,
+        id: &'a MessageId,
+    ) -> BoxFuture<'a, Result<(), InboxError>>;
 }
 
 /// Extension trait layered over [`InboxStore`]. Import it alongside

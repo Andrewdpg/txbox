@@ -17,7 +17,7 @@ handler is handed. Anything the handler does outside that connection — an
 HTTP call, a publish to another broker, a write to a different database —
 is not part of the transaction and will be repeated on redelivery.
 
-See [`docs/design.md`](docs/design.md#before-and-after) for a side-by-side
+See [`docs/design.md`](https://github.com/Andrewdpg/txbox/blob/main/docs/design.md#before-and-after) for a side-by-side
 comparison of a consumer with and without `txbox`.
 
 ## Quickstart
@@ -66,15 +66,27 @@ Import both: `InboxStore` for `migrate`/`purge`, `InboxExt` for
 |------------|------------|------------|
 | PostgreSQL | `postgres` | `sqlx` 0.9 |
 | SQLite     | `sqlite`   | `sqlx` 0.9 |
+| MySQL      | `mysql`    | `sqlx` 0.9 |
 
-Neither is enabled by default. `sqlx` is re-exported as `txbox::sqlx`, so
+None is enabled by default. `sqlx` is re-exported as `txbox::sqlx`, so
 handlers writing their own SQL stay on the same version.
+
+sqlx runs on tokio through the default `runtime-tokio` feature. For another
+runtime, turn defaults off and pick it on sqlx:
+
+```toml
+txbox = { version = "0.2", default-features = false, features = ["sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-smol"] }
+```
+
+MySQL needs 8.0.17 or later, and TLS or sqlx's `mysql-rsa` feature to
+authenticate.
 
 ## Read before you rely on this
 
 - **The inbox must live in the same database as the effect.** A shared
   central database for the inbox breaks the transaction silently — see
-  [`docs/operations.md`](docs/operations.md#the-inbox-must-live-in-the-same-database-as-the-effect).
+  [`docs/operations.md`](https://github.com/Andrewdpg/txbox/blob/main/docs/operations.md#the-inbox-must-live-in-the-same-database-as-the-effect).
 - **Two services consuming the same topic must use different `ConsumerId`s.**
   The dedup key is `(consumer_id, message_id)`; sharing one makes whichever
   service processes a message first cause the other to silently skip it.
@@ -89,7 +101,7 @@ handlers writing their own SQL stay on the same version.
   regardless of whether your handler ran, turning at-least-once delivery
   into at-most-once. See `examples/kafka_consumer.rs`.
 
-More on choosing a message id and consumer id: [`docs/guide.md`](docs/guide.md#choosing-a-message-id).
+More on choosing a message id and consumer id: [`docs/guide.md`](https://github.com/Andrewdpg/txbox/blob/main/docs/guide.md#choosing-a-message-id).
 
 ## Migrations
 
@@ -117,16 +129,24 @@ tooling instead of calling `migrate()`.
 
 Same shape, with `processed_at TEXT`. Also exposed as `sqlite::MIGRATION_SQL`.
 
-Running a per-tenant schema? See [`docs/guide.md`](docs/guide.md#multi-tenant-schemas).
+### MySQL
+
+Same shape, with `VARCHAR` ids, `processed_at DATETIME(6)` and a
+`claim_token` column used by `claim_many`. The table is `utf8mb4_0900_bin`,
+which compares ids byte for byte: MySQL's default collation ignores case and
+accents, and the older `utf8mb4_bin` pads with spaces, both of which would
+merge distinct message ids. Also exposed as `mysql::MIGRATION_SQL`.
+
+Running a per-tenant schema? See [`docs/guide.md`](https://github.com/Andrewdpg/txbox/blob/main/docs/guide.md#multi-tenant-schemas).
 
 ## More
 
-- [Batching several claims into one transaction](docs/guide.md#batching)
-- [Recording what a handler decided](docs/guide.md#recording-what-a-handler-decided)
-- [Sizing the connection pool, and contention under load](docs/operations.md#sizing-and-contention)
-- [Purge scheduling and observability](docs/operations.md#purge-scheduling)
-- [Notes before copying the bundled example into production](docs/operations.md#dont-copy-this-into-production)
-- [What this crate is deliberately out of scope for](docs/design.md#scope)
+- [Batching several claims into one transaction](https://github.com/Andrewdpg/txbox/blob/main/docs/guide.md#batching)
+- [Recording what a handler decided](https://github.com/Andrewdpg/txbox/blob/main/docs/guide.md#recording-what-a-handler-decided)
+- [Sizing the connection pool, and contention under load](https://github.com/Andrewdpg/txbox/blob/main/docs/operations.md#sizing-and-contention)
+- [Purge scheduling and observability](https://github.com/Andrewdpg/txbox/blob/main/docs/operations.md#purge-scheduling)
+- [Notes before copying the bundled example into production](https://github.com/Andrewdpg/txbox/blob/main/docs/operations.md#dont-copy-this-into-production)
+- [What this crate is deliberately out of scope for](https://github.com/Andrewdpg/txbox/blob/main/docs/design.md#scope)
 
 ## License
 

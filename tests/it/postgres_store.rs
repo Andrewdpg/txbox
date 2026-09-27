@@ -1,43 +1,17 @@
 #![cfg(feature = "postgres")]
 
+use crate::common::postgres;
+
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use sqlx::postgres::PgPoolOptions;
-use testcontainers_modules::postgres::Postgres as PostgresImage;
-use testcontainers_modules::testcontainers::ContainerAsync;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-use txbox::postgres::PgInbox;
 use txbox::{
     Claim, ClaimRequest, ConsumerId, InboxExt, InboxStore, MessageId, Outcome, RetentionPolicy,
 };
 
-/// The container handle must stay alive for as long as the pool is used;
-/// dropping it stops the database.
-async fn inbox() -> (ContainerAsync<PostgresImage>, PgInbox) {
-    let container = PostgresImage::default()
-        .with_tag("15-alpine")
-        .start()
-        .await
-        .expect("start postgres");
-    let port = container.get_host_port_ipv4(5432).await.expect("map port");
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
-
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&url)
-        .await
-        .expect("connect to postgres");
-
-    let inbox = PgInbox::new(pool);
-    inbox.migrate().await.expect("run migrations");
-    (container, inbox)
-}
-
 #[tokio::test]
 async fn claim_is_fresh_once_then_duplicate() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -64,7 +38,7 @@ async fn claim_is_fresh_once_then_duplicate() {
 
 #[tokio::test]
 async fn distinct_consumers_both_process_the_same_message() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let id = MessageId::try_from("shared-1").unwrap();
 
     for consumer in ["billing", "notifications"] {
@@ -79,7 +53,7 @@ async fn distinct_consumers_both_process_the_same_message() {
 
 #[tokio::test]
 async fn purge_deletes_only_entries_outside_the_window() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
 
     inbox
@@ -117,20 +91,13 @@ async fn purge_deletes_only_entries_outside_the_window() {
     assert_eq!(outcome, Outcome::Duplicate);
 }
 
-/// Retention is a temporal invariant: `max_age` must exceed the broker's
-/// redelivery window, or a purged row lets a redelivery through as fresh. An
-/// invariant measured against the clock of whichever replica happened to write
-/// the row is only as good as that replica's clock, and a slow one writes rows
-/// that look older than they are — purged early, inside the window, at exactly
-/// the load where extra replicas are running.
-///
-/// The database is already the one clock every replica shares, so the timestamp
-/// belongs to it. `now()` in PostgreSQL is the transaction's start time, so a
-/// row written by `claim` must equal it exactly. A timestamp taken in the
-/// application would land microseconds later.
+/// `processed_at` must come from the database clock: a replica with a slow
+/// clock would write rows that look older than they are, and purge could drop
+/// them inside the broker's redelivery window. `now()` is the transaction's
+/// start time, so the stored value must equal it exactly.
 #[tokio::test]
 async fn processed_at_comes_from_the_database_clock() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -183,7 +150,7 @@ fn incompressible(len: usize) -> String {
 /// limit should be revisited rather than quietly kept.
 #[tokio::test]
 async fn postgres_refuses_an_identifier_too_large_to_index() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
 
     let oversized = incompressible(4096);
     let result = sqlx::query(
@@ -208,8 +175,7 @@ async fn postgres_refuses_an_identifier_too_large_to_index() {
 
 /// One message per transaction means one fsync per message. `claim` is public
 /// and takes `&mut Conn`, so a caller can claim a whole batch inside a single
-/// transaction and amortise that cost. Nothing exercised that composition until
-/// now, which is why the README never offered it.
+/// transaction and amortise that cost.
 ///
 /// The property that makes it safe is subtle: a claim is visible to later
 /// statements in its own transaction before it is visible to anyone else. A
@@ -217,7 +183,7 @@ async fn postgres_refuses_an_identifier_too_large_to_index() {
 /// that catches a redelivery, with no bookkeeping by the caller.
 #[tokio::test]
 async fn a_duplicate_inside_one_batch_is_caught_before_the_commit() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let batch = ["a", "b", "a"].map(|id| MessageId::try_from(id).unwrap());
 
@@ -236,14 +202,12 @@ async fn a_duplicate_inside_one_batch_is_caught_before_the_commit() {
     assert_eq!(claims, [Claim::Fresh, Claim::Fresh, Claim::Duplicate]);
 }
 
-/// The other half of the bargain. A batch is one transaction, so it is also one
-/// unit of failure: if anything in it fails, every message it covered goes back
-/// to being unclaimed and the broker redelivers the whole batch. That is the
-/// cost of amortising the commit, and a caller choosing a batch size is
-/// choosing how much work a single failure repeats.
+/// A batch is one transaction, so it is also one unit of failure: if anything
+/// in it fails, every message goes back to unclaimed and the broker redelivers
+/// the whole batch.
 #[tokio::test]
 async fn a_batch_that_rolls_back_leaves_every_message_unclaimed() {
-    let (_container, inbox) = inbox().await;
+    let (_container, inbox) = postgres(8).await;
     let consumer = ConsumerId::try_from("billing").unwrap();
     let batch = ["a", "b"].map(|id| MessageId::try_from(id).unwrap());
 
@@ -280,12 +244,10 @@ async fn a_batch_that_rolls_back_leaves_every_message_unclaimed() {
 /// fresh, or a concurrent claim may be in flight — so a caller relying on this
 /// method rather than `process` must still treat `false` as "unknown", never
 /// "fresh".
-///
-/// That asymmetry is the entire contract, and it is why the answer is
-/// reported as "known duplicate" rather than "duplicate".
+
 #[tokio::test]
 async fn a_committed_claim_is_a_known_duplicate() {
-    let (_container, db) = inbox().await;
+    let (_container, db) = postgres(8).await;
     let billing = db.consumer(ConsumerId::try_from("billing").unwrap());
     let id = MessageId::try_from("m-1").unwrap();
 
@@ -303,4 +265,22 @@ async fn a_committed_claim_is_a_known_duplicate() {
         billing.is_known_duplicate(&id).await.unwrap(),
         "a committed claim must be visible to is_known_duplicate"
     );
+}
+
+#[tokio::test]
+async fn claim_many_claims_a_large_batch_in_one_call() {
+    let (_container, inbox) = postgres(8).await;
+    let consumer = inbox.consumer(ConsumerId::try_from("bulk").unwrap());
+    let ids: Vec<MessageId> = (0..10_000)
+        .map(|i| MessageId::try_from(format!("m{i}")).unwrap())
+        .collect();
+
+    let mut tx = consumer.begin().await.unwrap();
+    let first = consumer.claim_many(&mut tx, &ids[..5_000]).await.unwrap();
+    let second = consumer.claim_many(&mut tx, &ids).await.unwrap();
+    consumer.commit(tx).await.unwrap();
+
+    assert!(first.iter().all(|c| *c == Claim::Fresh));
+    assert!(second[..5_000].iter().all(|c| *c == Claim::Duplicate));
+    assert!(second[5_000..].iter().all(|c| *c == Claim::Fresh));
 }

@@ -1,6 +1,6 @@
 [package]
 name = "txbox"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # Inherited from sqlx 0.9, whose MSRV policy sets 1.94.0 for this release
 # cycle. This is not a preference: it is the floor the dependency imposes.
@@ -15,21 +15,31 @@ categories = ["database", "asynchronous"]
 exclude = ["docs/"]
 
 [dependencies]
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio"] }
+sqlx = { version = "0.9", optional = true, default-features = false }
 thiserror = "2"
 tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+getrandom = { version = "0.4", optional = true }
 rdkafka = { version = "0.39", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
-testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
 tracing-subscriber = "0.3"
 
 [features]
-default = []
-postgres = ["sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
-sqlite = ["sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+default = ["runtime-tokio"]
+# Forwards to sqlx only when a backend already pulled sqlx in (the `?`), so
+# it costs nothing for a crate that only implements `InboxStore`. Turn it off
+# with `default-features = false` and enable another sqlx runtime yourself.
+runtime-tokio = ["sqlx?/runtime-tokio"]
+postgres = ["dep:sqlx", "sqlx/postgres", "sqlx/chrono", "sqlx/migrate", "sqlx/macros"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "sqlx/chrono", "sqlx/migrate", "sqlx/macros", "sqlx/json"]
+# Plaintext connections to MySQL 8.4 need sqlx's `mysql-rsa` feature for
+# password auth; it is left to you (TLS is the production norm).
+mysql = ["dep:sqlx", "dep:getrandom", "sqlx/mysql", "sqlx/chrono", "sqlx/migrate", "sqlx/macros", "sqlx/json"]
+# Exposes `txbox::testing::conformance` for backend authors. No dependencies.
+testing = []
 example-kafka = ["dep:rdkafka", "postgres"]
 
 [[example]]
@@ -37,5 +47,5 @@ name = "kafka_consumer"
 required-features = ["example-kafka"]
 
 [package.metadata.docs.rs]
-features = ["postgres", "sqlite"]
+features = ["postgres", "sqlite", "mysql", "testing"]
 rustdoc-args = ["--cfg", "docsrs"]

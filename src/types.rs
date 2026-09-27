@@ -141,6 +141,42 @@ impl<'a> ClaimRequest<'a> {
     }
 }
 
+/// A request to record several messages at once, submitted to
+/// [`InboxStore::claim_many`](crate::store::InboxStore::claim_many).
+///
+/// [`Consumer`](crate::consumer::Consumer) builds it with `ids` already
+/// deduplicated and sorted by bytes, so backends can rely on both: sorted
+/// ids take row locks in one global order, which is what keeps concurrent
+/// overlapping batches from deadlocking.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy)]
+pub struct ClaimBatch<'a> {
+    /// The consumer performing the claims.
+    pub consumer: &'a ConsumerId,
+    /// The messages being claimed: unique, sorted by bytes.
+    pub ids: &'a [&'a MessageId],
+    /// Bounds how long the backend will wait for a contended row, as in
+    /// [`ClaimRequest::lock_timeout`].
+    pub lock_timeout: Option<Duration>,
+}
+
+impl<'a> ClaimBatch<'a> {
+    /// Builds a batch for `consumer` claiming `ids`, with no lock timeout.
+    pub fn new(consumer: &'a ConsumerId, ids: &'a [&'a MessageId]) -> Self {
+        Self {
+            consumer,
+            ids,
+            lock_timeout: None,
+        }
+    }
+
+    /// Sets the lock timeout.
+    pub fn with_lock_timeout(mut self, lock_timeout: Duration) -> Self {
+        self.lock_timeout = Some(lock_timeout);
+        self
+    }
+}
+
 /// The result of running a handler through the inbox.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome<T> {
